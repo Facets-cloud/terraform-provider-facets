@@ -1,7 +1,8 @@
 terraform {
   required_providers {
     facets = {
-      source = "localhost/facets-cloud/facets"
+      source  = "facets.cloud/facets-cloud/facets"
+      version = "0.1.0"
     }
   }
 }
