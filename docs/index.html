@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Facets Terraform Provider Registry</title>
+</head>
+<body>
+  <h1>Facets Terraform Provider Registry</h1>
+  <p>This is a custom Terraform provider registry for the Facets provider.</p>
+  <h2>Usage</h2>
+  <pre>
+terraform {
+  required_providers {
+    facets = {
+      source  = "facets.cloud/facets-cloud/facets"
+      version = "~> 0.1.0"
+    }
+  }
+}
+</pre>
+  <p>Configure your <code>~/.terraformrc</code>:</p>
+  <pre>
+provider_installation {
+  network_mirror {
+    url = "https://facets-cloud.github.io/terraform-provider-facets/"
+    include = ["facets.cloud/*/*"]
+  }
+  direct {
+    exclude = ["facets.cloud/*/*"]
+  }
+}
+</pre>
+</body>
+</html>
