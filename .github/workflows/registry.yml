@@ -26,24 +26,25 @@ jobs:
           # Get all releases
           RELEASES=$(gh release list --limit 100 --json tagName,isPrerelease | jq -r '.[] | select(.isPrerelease == false) | .tagName')
 
-          # Create docs directory
-          mkdir -p docs/terraform-provider-facets
+          # Create docs directory with registry structure
+          # Path: hostname/namespace/type/
+          mkdir -p docs/facets.cloud/facets-cloud/facets
 
           # Generate versions list
-          echo "{" > docs/terraform-provider-facets/index.json
-          echo "  \"versions\": [" >> docs/terraform-provider-facets/index.json
+          echo "{" > docs/facets.cloud/facets-cloud/facets/index.json
+          echo "  \"versions\": [" >> docs/facets.cloud/facets-cloud/facets/index.json
           FIRST=true
           for TAG in $RELEASES; do
             VERSION=${TAG#v}
             if [ "$FIRST" = true ]; then
-              echo "    \"$VERSION\"" >> docs/terraform-provider-facets/index.json
+              echo "    \"$VERSION\"" >> docs/facets.cloud/facets-cloud/facets/index.json
               FIRST=false
             else
-              echo "    ,\"$VERSION\"" >> docs/terraform-provider-facets/index.json
+              echo "    ,\"$VERSION\"" >> docs/facets.cloud/facets-cloud/facets/index.json
             fi
           done
-          echo "  ]" >> docs/terraform-provider-facets/index.json
-          echo "}" >> docs/terraform-provider-facets/index.json
+          echo "  ]" >> docs/facets.cloud/facets-cloud/facets/index.json
+          echo "}" >> docs/facets.cloud/facets-cloud/facets/index.json
 
           # For each version, generate version metadata
           for TAG in $RELEASES; do
@@ -54,10 +55,10 @@ jobs:
             ASSETS=$(gh release view $TAG --json assets -q '.assets')
 
             # Create version directory
-            mkdir -p docs/terraform-provider-facets/$VERSION
+            mkdir -p docs/facets.cloud/facets-cloud/facets/$VERSION
 
             # Generate download metadata
-            cat > docs/terraform-provider-facets/$VERSION/download.json << EOF
+            cat > docs/facets.cloud/facets-cloud/facets/$VERSION/download.json << EOF
           {
             "protocols": ["5.0"],
             "os": {
@@ -79,7 +80,7 @@ jobs:
               SHA256=$(curl -sL "$SHASUMS_URL" | grep "$ASSET" | cut -d' ' -f1 || echo "")
 
               # Add to JSON (simplified structure)
-              cat >> docs/terraform-provider-facets/$VERSION/download.json << INNER_EOF
+              cat >> docs/facets.cloud/facets-cloud/facets/$VERSION/download.json << INNER_EOF
                 "$OS": {
                   "$ARCH": {
                     "url": "$DOWNLOAD_URL",
@@ -90,8 +91,8 @@ jobs:
             done
 
             # Close JSON (remove last comma and close braces)
-            sed -i '$ s/,$//' docs/terraform-provider-facets/$VERSION/download.json
-            cat >> docs/terraform-provider-facets/$VERSION/download.json << EOF
+            sed -i '$ s/,$//' docs/facets.cloud/facets-cloud/facets/$VERSION/download.json
+            cat >> docs/facets.cloud/facets-cloud/facets/$VERSION/download.json << EOF
               },
             "shasums_url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/$TAG/terraform-provider-facets_${VERSION}_SHA256SUMS",
             "shasums_signature_url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/$TAG/terraform-provider-facets_${VERSION}_SHA256SUMS.sig"
