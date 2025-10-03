@@ -36,3 +36,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT }}
+
+      - name: Publish to GitHub Pages Registry
+        uses: AbsaOSS/ghpages-to-tf-provider-registry@v0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts_dir: dist
+          gpg_keyid: ${{ secrets.GPG_FINGERPRINT }}
+          gpg_ascii_armor: ${{ secrets.GPG_PRIVATE_KEY }}
