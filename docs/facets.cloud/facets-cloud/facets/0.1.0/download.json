@@ -1,0 +1,43 @@
+{
+  "protocols": ["5.0"],
+  "os": {
+      "amd64": {
+        "amd64": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_darwin_amd64.zip",
+          "sha256": "7ed954e7f30c1710d01f1fe50481c44b42f70a36613cbce05e1e730fb20efb17"
+        }
+      },
+      "arm64": {
+        "arm64": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_darwin_arm64.zip",
+          "sha256": "a4ebce96b2e5e242b7145d3559b378189b402256c3daeec209bec2960e1c116a"
+        }
+      },
+      "amd64": {
+        "amd64": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_linux_amd64.zip",
+          "sha256": "f451456a08badc774bf7842b1e68d6be0aae3d2041851ac30958e32044b0cd58"
+        }
+      },
+      "arm": {
+        "arm": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_linux_arm.zip",
+          "sha256": "5399bf5284a82b37a87e5acd283386367d9f52f5c784db24bf8a3a747bd9c120"
+        }
+      },
+      "arm64": {
+        "arm64": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_linux_arm64.zip",
+          "sha256": "f35205e2506d82a8cc34b59e8633e691ff528a0d67ca27d28aac2381fe89eee3"
+        }
+      },
+      "amd64": {
+        "amd64": {
+          "url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_windows_amd64.zip",
+          "sha256": "ab982021a4c50a6d8fa48dd3d70ae113f616c6fb5f2cc44fcabba32f8a17e164"
+        }
+      }
+    },
+  "shasums_url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_SHA256SUMS",
+  "shasums_signature_url": "https://github.com/Facets-cloud/terraform-provider-facets/releases/download/v0.1.0/terraform-provider-facets_0.1.0_SHA256SUMS.sig"
+}
