@@ -310,24 +310,13 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Generate names using hash for uniqueness
-	hashInput := fmt.Sprintf("%s-%s-%s", plan.FacetsResourceName.ValueString(), facetsEnv.UniqueName.ValueString(), plan.Name.ValueString())
-	nameHash := fmt.Sprintf("%x", md5.Sum([]byte(hashInput)))
-
-	// Build stepActionName with prefix, ensuring uniqueness if truncated
-	stepActionName := fmt.Sprintf("setup-credentials-%s", nameHash)
-	if len(stepActionName) > 63 {
-		// Keep last 63 chars to preserve unique hash suffix
-		stepActionName = stepActionName[len(stepActionName)-63:]
-	}
-	plan.StepActionName = types.StringValue(stepActionName)
-
-	// Build taskName, ensuring uniqueness if truncated
-	taskName := nameHash
-	if len(taskName) > 63 {
-		// Keep last 63 chars to preserve unique hash suffix
-		taskName = taskName[len(taskName)-63:]
-	}
+	taskName, stepActionName := generateResourceNames(
+		plan.FacetsResourceName.ValueString(),
+		facetsEnv.UniqueName.ValueString(),
+		plan.Name.ValueString(),
+	)
 	plan.TaskName = types.StringValue(taskName)
+	plan.StepActionName = types.StringValue(stepActionName)
 	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), taskName))
 
 	// Read cluster_id from environment variable
@@ -337,13 +326,13 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Create labels
-	labels := map[string]interface{}{
-		"display_name":            plan.Name.ValueString(),
-		"resource_name":           plan.FacetsResourceName.ValueString(),
-		"resource_kind":           facetsRes.Kind.ValueString(),
-		"environment_unique_name": facetsEnv.UniqueName.ValueString(),
-		"cluster_id":              clusterID,
-	}
+	labels := buildLabels(
+		plan.Name.ValueString(),
+		plan.FacetsResourceName.ValueString(),
+		facetsRes.Kind.ValueString(),
+		facetsEnv.UniqueName.ValueString(),
+		clusterID,
+	)
 
 	// Create StepAction
 	stepAction := r.buildStepAction(plan, labels)
@@ -433,13 +422,13 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	}
 
 	// Create labels
-	labels := map[string]interface{}{
-		"display_name":            plan.Name.ValueString(),
-		"resource_name":           plan.FacetsResourceName.ValueString(),
-		"resource_kind":           facetsRes.Kind.ValueString(),
-		"environment_unique_name": facetsEnv.UniqueName.ValueString(),
-		"cluster_id":              clusterID,
-	}
+	labels := buildLabels(
+		plan.Name.ValueString(),
+		plan.FacetsResourceName.ValueString(),
+		facetsRes.Kind.ValueString(),
+		facetsEnv.UniqueName.ValueString(),
+		clusterID,
+	)
 
 	// Update StepAction
 	stepAction := r.buildStepAction(plan, labels)
@@ -567,6 +556,64 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// Helper functions for testability
+
+// generateResourceNames creates deterministic names for Task and StepAction
+// Returns (taskName, stepActionName)
+func generateResourceNames(resourceName, envName, displayName string) (string, string) {
+	hashInput := fmt.Sprintf("%s-%s-%s", resourceName, envName, displayName)
+	nameHash := fmt.Sprintf("%x", md5.Sum([]byte(hashInput)))
+
+	// Build stepActionName with prefix
+	stepActionName := fmt.Sprintf("setup-credentials-%s", nameHash)
+	if len(stepActionName) > 63 {
+		// Keep last 63 chars to preserve unique hash suffix
+		stepActionName = stepActionName[len(stepActionName)-63:]
+	}
+
+	// TaskName is just the hash
+	taskName := nameHash
+	if len(taskName) > 63 {
+		taskName = taskName[len(taskName)-63:]
+	}
+
+	return taskName, stepActionName
+}
+
+// buildLabels creates the standard label map for Tekton resources
+func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string) map[string]interface{} {
+	return map[string]interface{}{
+		"display_name":            displayName,
+		"resource_name":           resourceName,
+		"resource_kind":           resourceKind,
+		"environment_unique_name": envUniqueName,
+		"cluster_id":              clusterID,
+	}
+}
+
+// extractMetadata extracts namespace and name from an unstructured object
+// Returns (namespace, name, error)
+func extractMetadata(obj *unstructured.Unstructured) (string, string, error) {
+	metadata, hasMetadata := obj.Object["metadata"]
+	if !hasMetadata {
+		return "", "", fmt.Errorf("no metadata key in object")
+	}
+
+	metadataMap, isMap := metadata.(map[string]interface{})
+	if !isMap {
+		return "", "", fmt.Errorf("metadata is not a map: %T", metadata)
+	}
+
+	namespace, hasNS := metadataMap["namespace"].(string)
+	name, hasName := metadataMap["name"].(string)
+
+	if !hasNS || !hasName || namespace == "" || name == "" {
+		return "", "", fmt.Errorf("missing or empty namespace/name: hasNS=%v ns=%s, hasName=%v name=%s", hasNS, namespace, hasName, name)
+	}
+
+	return namespace, name, nil
 }
 
 func (r *TektonActionKubernetesResource) buildStepAction(plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
@@ -757,21 +804,9 @@ func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj
 	}
 
 	// Extract namespace and name from metadata
-	metadata, hasMetadata := obj.Object["metadata"]
-	if !hasMetadata {
-		return fmt.Errorf("no metadata key in object")
-	}
-
-	metadataMap, isMap := metadata.(map[string]interface{})
-	if !isMap {
-		return fmt.Errorf("metadata is not a map: %T", metadata)
-	}
-
-	namespace, hasNS := metadataMap["namespace"].(string)
-	name, hasName := metadataMap["name"].(string)
-
-	if !hasNS || !hasName || namespace == "" || name == "" {
-		return fmt.Errorf("missing name/namespace: hasNS=%v ns=%s, hasName=%v name=%s", hasNS, namespace, hasName, name)
+	namespace, name, err := extractMetadata(obj)
+	if err != nil {
+		return err
 	}
 
 	// Get current resource to preserve resourceVersion
