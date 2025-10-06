@@ -400,6 +400,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	plan.StepActionName = state.StepActionName
 	plan.TaskName = state.TaskName
 	plan.ID = state.ID
+	plan.Namespace = state.Namespace
 
 	// Extract environment unique_name from environment object
 	var facetsEnv FacetsEnvironmentModel
