@@ -219,6 +219,20 @@ The provider is built using the Terraform Plugin Framework and follows these key
 2. **In-cluster authentication priority**: Service account tokens are automatically used when available
 3. **Type flexibility**: Uses dynamic types for fields that accept any structure (environment, instance, params, resources)
 
+### Running Tests
+
+**Unit Tests:**
+```bash
+go test -v ./internal/provider/
+```
+
+**Integration Tests:**
+```bash
+./tests/integration/test.sh
+```
+
+See [tests/integration/README.md](tests/integration/README.md) for detailed integration test documentation.
+
 ## Project Structure
 
 ```
