@@ -5,10 +5,13 @@ import (
 	"crypto/md5"
 	"fmt"
 	"os"
+	"regexp"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,8 +21,9 @@ import (
 )
 
 var (
-	_ resource.Resource              = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithConfigure = &TektonActionKubernetesResource{}
+	_ resource.Resource                = &TektonActionKubernetesResource{}
+	_ resource.ResourceWithConfigure   = &TektonActionKubernetesResource{}
+	_ resource.ResourceWithImportState = &TektonActionKubernetesResource{}
 )
 
 func NewTektonActionKubernetesResource() resource.Resource {
@@ -78,7 +82,6 @@ type EnvVarModel struct {
 	Value types.String `tfsdk:"value"`
 }
 
-
 func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_tekton_action_kubernetes"
 }
@@ -97,6 +100,10 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 			"name": schema.StringAttribute{
 				Description: "Display name of the Tekton Task",
 				Required:    true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.LengthAtMost(253),
+				},
 			},
 			"description": schema.StringAttribute{
 				Description: "Description of the Tekton Task",
@@ -106,6 +113,10 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 				Description: "Resource name as defined in the Facets blueprint. " +
 					"Used to map the Tekton task back to the blueprint resource in Facets.",
 				Required: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.LengthAtMost(253),
+				},
 			},
 			"facets_environment": schema.SingleNestedAttribute{
 				Description: "Facets-managed environment configuration. " +
@@ -115,6 +126,10 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					"unique_name": schema.StringAttribute{
 						Description: "Unique name of the Facets-managed environment",
 						Required:    true,
+						Validators: []validator.String{
+							stringvalidator.LengthAtLeast(1),
+							stringvalidator.LengthAtMost(253),
+						},
 					},
 				},
 			},
@@ -145,6 +160,13 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 				Description: "Kubernetes namespace for Tekton resources",
 				Optional:    true,
 				Computed:    true,
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(
+						regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`),
+						"must be a valid Kubernetes namespace name (lowercase alphanumeric and hyphens, cannot start or end with hyphen)",
+					),
+					stringvalidator.LengthAtMost(63),
+				},
 			},
 			"steps": schema.ListNestedAttribute{
 				Description: "List of steps for the Tekton Task",
@@ -154,6 +176,10 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 						"name": schema.StringAttribute{
 							Description: "Step name",
 							Required:    true,
+							Validators: []validator.String{
+								stringvalidator.LengthAtLeast(1),
+								stringvalidator.LengthAtMost(253),
+							},
 						},
 						"image": schema.StringAttribute{
 							Description: "Container image for the step",
@@ -187,6 +213,13 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 									"name": schema.StringAttribute{
 										Description: "Environment variable name",
 										Required:    true,
+										Validators: []validator.String{
+											stringvalidator.LengthAtLeast(1),
+											stringvalidator.RegexMatches(
+												regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`),
+												"must be a valid environment variable name (uppercase letters, numbers, and underscores, cannot start with a number)",
+											),
+										},
 									},
 									"value": schema.StringAttribute{
 										Description: "Environment variable value",
@@ -206,10 +239,17 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 						"name": schema.StringAttribute{
 							Description: "Parameter name",
 							Required:    true,
+							Validators: []validator.String{
+								stringvalidator.LengthAtLeast(1),
+								stringvalidator.LengthAtMost(253),
+							},
 						},
 						"type": schema.StringAttribute{
 							Description: "Parameter type (e.g., string, array)",
 							Required:    true,
+							Validators: []validator.String{
+								stringvalidator.OneOf("string", "array", "object"),
+							},
 						},
 					},
 				},
@@ -451,6 +491,84 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 	}
 }
 
+func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Import format: namespace/taskName
+	// Example: tekton-pipelines/59f6f855860ddc99a32e2944c96db5fa
+
+	idParts := regexp.MustCompile(`^([^/]+)/([^/]+)$`).FindStringSubmatch(req.ID)
+	if len(idParts) != 3 {
+		resp.Diagnostics.AddError(
+			"Invalid Import ID",
+			fmt.Sprintf("Expected import ID in format: namespace/taskName, got: %s", req.ID),
+		)
+		return
+	}
+
+	namespace := idParts[1]
+	taskName := idParts[2]
+
+	// Verify Task exists
+	gvr := k8sschema.GroupVersionResource{
+		Group:    "tekton.dev",
+		Version:  "v1beta1",
+		Resource: "tasks",
+	}
+
+	task, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, taskName, metav1.GetOptions{})
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error importing resource",
+			fmt.Sprintf("Could not find Task %s/%s: %s", namespace, taskName, err.Error()),
+		)
+		return
+	}
+
+	// Extract metadata from labels
+	labels, found, _ := unstructured.NestedStringMap(task.Object, "metadata", "labels")
+	if !found {
+		resp.Diagnostics.AddError(
+			"Error importing resource",
+			"Task does not have required labels for import",
+		)
+		return
+	}
+
+	displayName, hasDisplayName := labels["display_name"]
+	resourceName, hasResourceName := labels["resource_name"]
+	_, hasResourceKind := labels["resource_kind"]
+	_, hasEnvUniqueName := labels["environment_unique_name"]
+
+	if !hasDisplayName || !hasResourceName || !hasResourceKind || !hasEnvUniqueName {
+		resp.Diagnostics.AddError(
+			"Error importing resource",
+			"Task missing required labels: display_name, resource_name, resource_kind, environment_unique_name",
+		)
+		return
+	}
+
+	// Find StepAction (convention: setup-credentials-{hash})
+	stepActionName := fmt.Sprintf("setup-credentials-%s", taskName)
+
+	// Set state with imported values
+	state := TektonActionKubernetesResourceModel{
+		ID:                 types.StringValue(fmt.Sprintf("%s/%s", namespace, taskName)),
+		Name:               types.StringValue(displayName),
+		FacetsResourceName: types.StringValue(resourceName),
+		Namespace:          types.StringValue(namespace),
+		TaskName:           types.StringValue(taskName),
+		StepActionName:     types.StringValue(stepActionName),
+	}
+
+	// Note: We cannot fully reconstruct facets_environment, facets_resource, steps, params from the Task
+	// User will need to manually specify these in their configuration
+	resp.Diagnostics.AddWarning(
+		"Partial Import",
+		"Only basic fields were imported. You must manually specify: facets_environment, facets_resource, steps, and params in your configuration.",
+	)
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
 func (r *TektonActionKubernetesResource) buildStepAction(plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
 	stepAction := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -638,7 +756,7 @@ func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj
 		Resource: resource,
 	}
 
-	// DEBUG: Try to see what we have
+	// Extract namespace and name from metadata
 	metadata, hasMetadata := obj.Object["metadata"]
 	if !hasMetadata {
 		return fmt.Errorf("no metadata key in object")
@@ -653,7 +771,7 @@ func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj
 	name, hasName := metadataMap["name"].(string)
 
 	if !hasNS || !hasName || namespace == "" || name == "" {
-		return fmt.Errorf("missing name/namespace: hasNS=%v ns=%s, hasName=%v name=%s, metadata=%+v", hasNS, namespace, hasName, name, metadataMap)
+		return fmt.Errorf("missing name/namespace: hasNS=%v ns=%s, hasName=%v name=%s", hasNS, namespace, hasName, name)
 	}
 
 	// Get current resource to preserve resourceVersion
@@ -667,14 +785,6 @@ func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj
 
 	_, err = r.client.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	return err
-}
-
-func keysOf(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 func (r *TektonActionKubernetesResource) deleteResource(ctx context.Context, namespace, name, group, version, resource string) error {
