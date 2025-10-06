@@ -3,15 +3,14 @@ package provider
 import (
 	"context"
 	"crypto/md5"
-	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -32,17 +31,33 @@ type TektonActionKubernetesResource struct {
 }
 
 type TektonActionKubernetesResourceModel struct {
-	ID             types.String  `tfsdk:"id"`
-	Name           types.String  `tfsdk:"name"`
-	Description    types.String  `tfsdk:"description"`
-	InstanceName   types.String  `tfsdk:"instance_name"`
-	Environment    types.Dynamic `tfsdk:"environment"`
-	Instance       types.Dynamic `tfsdk:"instance"`
-	Namespace      types.String  `tfsdk:"namespace"`
-	Steps          types.List    `tfsdk:"steps"`
-	Params         types.Dynamic `tfsdk:"params"`
-	TaskName       types.String  `tfsdk:"task_name"`
-	StepActionName types.String  `tfsdk:"step_action_name"`
+	ID                 types.String `tfsdk:"id"`
+	Name               types.String `tfsdk:"name"`
+	Description        types.String `tfsdk:"description"`
+	FacetsResourceName types.String `tfsdk:"facets_resource_name"`
+	FacetsEnvironment  types.Object `tfsdk:"facets_environment"`
+	FacetsResource     types.Object `tfsdk:"facets_resource"`
+	Namespace          types.String `tfsdk:"namespace"`
+	Steps              types.List   `tfsdk:"steps"`
+	Params             types.List   `tfsdk:"params"`
+	TaskName           types.String `tfsdk:"task_name"`
+	StepActionName     types.String `tfsdk:"step_action_name"`
+}
+
+type FacetsEnvironmentModel struct {
+	UniqueName types.String `tfsdk:"unique_name"`
+}
+
+type FacetsResourceModel struct {
+	Kind    types.String  `tfsdk:"kind"`
+	Flavor  types.String  `tfsdk:"flavor"`
+	Version types.String  `tfsdk:"version"`
+	Spec    types.Dynamic `tfsdk:"spec"`
+}
+
+type ParamModel struct {
+	Name types.String `tfsdk:"name"`
+	Type types.String `tfsdk:"type"`
 }
 
 type StepModel struct {
@@ -51,6 +66,11 @@ type StepModel struct {
 	Script    types.String `tfsdk:"script"`
 	Resources types.Object `tfsdk:"resources"`
 	Env       types.List   `tfsdk:"env"`
+}
+
+type ComputeResourcesModel struct {
+	Requests types.Map `tfsdk:"requests"`
+	Limits   types.Map `tfsdk:"limits"`
 }
 
 type EnvVarModel struct {
@@ -65,7 +85,10 @@ func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resou
 
 func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages a Tekton Task and StepAction for Kubernetes-based workflows",
+		Description: "Manages a Tekton Task and StepAction for Kubernetes-based workflows. " +
+			"This resource automatically injects Kubernetes credentials (FACETS_USER_KUBECONFIG) " +
+			"via a setup-credentials step, which is populated by the Facets UI when users run actions. " +
+			"The kubeconfig is scoped to the user's RBAC permissions.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Resource identifier",
@@ -79,17 +102,44 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 				Description: "Description of the Tekton Task",
 				Optional:    true,
 			},
-			"instance_name": schema.StringAttribute{
-				Description: "Resource instance name",
-				Required:    true,
+			"facets_resource_name": schema.StringAttribute{
+				Description: "Resource name as defined in the Facets blueprint. " +
+					"Used to map the Tekton task back to the blueprint resource in Facets.",
+				Required: true,
 			},
-			"environment": schema.DynamicAttribute{
-				Description: "Environment object (any type)",
-				Required:    true,
+			"facets_environment": schema.SingleNestedAttribute{
+				Description: "Facets-managed environment configuration. " +
+					"Specifies which environment this action runs in.",
+				Required: true,
+				Attributes: map[string]schema.Attribute{
+					"unique_name": schema.StringAttribute{
+						Description: "Unique name of the Facets-managed environment",
+						Required:    true,
+					},
+				},
 			},
-			"instance": schema.DynamicAttribute{
-				Description: "Instance object (any type)",
-				Required:    true,
+			"facets_resource": schema.SingleNestedAttribute{
+				Description: "Resource definition as specified in the Facets blueprint. " +
+					"Used to map the Tekton task back to the blueprint resource in Facets.",
+				Required: true,
+				Attributes: map[string]schema.Attribute{
+					"kind": schema.StringAttribute{
+						Description: "Resource kind",
+						Required:    true,
+					},
+					"flavor": schema.StringAttribute{
+						Description: "Resource flavor",
+						Required:    true,
+					},
+					"version": schema.StringAttribute{
+						Description: "Resource version",
+						Required:    true,
+					},
+					"spec": schema.DynamicAttribute{
+						Description: "Resource specification (any type)",
+						Required:    true,
+					},
+				},
 			},
 			"namespace": schema.StringAttribute{
 				Description: "Kubernetes namespace for Tekton resources",
@@ -113,10 +163,21 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 							Description: "Script to execute in the step",
 							Required:    true,
 						},
-						"resources": schema.ObjectAttribute{
-							Description:    "Resource requests and limits",
-							Required:       true,
-							AttributeTypes: map[string]attr.Type{},
+						"resources": schema.SingleNestedAttribute{
+							Description: "Compute resources (requests and limits) for the step",
+							Optional:    true,
+							Attributes: map[string]schema.Attribute{
+								"requests": schema.MapAttribute{
+									Description: "Minimum compute resources required (e.g., cpu, memory)",
+									Optional:    true,
+									ElementType: types.StringType,
+								},
+								"limits": schema.MapAttribute{
+									Description: "Maximum compute resources allowed (e.g., cpu, memory)",
+									Optional:    true,
+									ElementType: types.StringType,
+								},
+							},
 						},
 						"env": schema.ListNestedAttribute{
 							Description: "Environment variables for the step",
@@ -137,17 +198,31 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					},
 				},
 			},
-			"params": schema.DynamicAttribute{
-				Description: "List of params for the Tekton Task (any type)",
+			"params": schema.ListNestedAttribute{
+				Description: "List of params for the Tekton Task",
 				Optional:    true,
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"name": schema.StringAttribute{
+							Description: "Parameter name",
+							Required:    true,
+						},
+						"type": schema.StringAttribute{
+							Description: "Parameter type (e.g., string, array)",
+							Required:    true,
+						},
+					},
+				},
 			},
 			"task_name": schema.StringAttribute{
-				Description: "Generated Tekton Task name",
-				Computed:    true,
+				Description: "Generated Tekton Task name (computed from hash of resource_name, environment, and name). " +
+					"This is the actual Kubernetes resource name and may be truncated to 63 characters.",
+				Computed: true,
 			},
 			"step_action_name": schema.StringAttribute{
-				Description: "Generated StepAction name",
-				Computed:    true,
+				Description: "Generated StepAction name for credential setup (computed from hash). " +
+					"This StepAction automatically configures Kubernetes access for the workflow steps.",
+				Computed: true,
 			},
 		},
 	}
@@ -181,69 +256,52 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Extract environment unique_name from environment object
-	var envMap map[string]interface{}
-	if err := json.Unmarshal([]byte(plan.Environment.String()), &envMap); err != nil {
-		resp.Diagnostics.AddError(
-			"Error parsing environment",
-			fmt.Sprintf("Could not parse environment object: %s", err.Error()),
-		)
+	var facetsEnv FacetsEnvironmentModel
+	resp.Diagnostics.Append(plan.FacetsEnvironment.As(ctx, &facetsEnv, basetypes.ObjectAsOptions{})...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	envName := ""
-	if uniqueName, ok := envMap["unique_name"].(string); ok {
-		envName = uniqueName
-	}
 
-	// Extract cluster_id and resource_kind from instance object
-	var instanceMap map[string]interface{}
-	if err := json.Unmarshal([]byte(plan.Instance.String()), &instanceMap); err != nil {
-		resp.Diagnostics.AddError(
-			"Error parsing instance",
-			fmt.Sprintf("Could not parse instance object: %s", err.Error()),
-		)
+	// Extract resource_kind from facets_resource object
+	var facetsRes FacetsResourceModel
+	resp.Diagnostics.Append(plan.FacetsResource.As(ctx, &facetsRes, basetypes.ObjectAsOptions{})...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	resourceKind := ""
-	if kind, ok := instanceMap["kind"].(string); ok {
-		resourceKind = kind
-	}
 
-	// Generate names
-	nameHash := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s-%s-%s", plan.InstanceName.ValueString(), envName, plan.Name.ValueString()))))
+	// Generate names using hash for uniqueness
+	hashInput := fmt.Sprintf("%s-%s-%s", plan.FacetsResourceName.ValueString(), facetsEnv.UniqueName.ValueString(), plan.Name.ValueString())
+	nameHash := fmt.Sprintf("%x", md5.Sum([]byte(hashInput)))
 
+	// Build stepActionName with prefix, ensuring uniqueness if truncated
 	stepActionName := fmt.Sprintf("setup-credentials-%s", nameHash)
 	if len(stepActionName) > 63 {
-		stepActionName = stepActionName[:63]
+		// Keep last 63 chars to preserve unique hash suffix
+		stepActionName = stepActionName[len(stepActionName)-63:]
 	}
 	plan.StepActionName = types.StringValue(stepActionName)
 
+	// Build taskName, ensuring uniqueness if truncated
 	taskName := nameHash
 	if len(taskName) > 63 {
-		taskName = taskName[:63]
+		// Keep last 63 chars to preserve unique hash suffix
+		taskName = taskName[len(taskName)-63:]
 	}
 	plan.TaskName = types.StringValue(taskName)
 	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), taskName))
 
-	// Read deployment context for cluster_id
-	clusterID := ""
-	deploymentContextData, err := os.ReadFile("/sources/primary/capillary-cloud-tf/deploymentcontext.json")
-	if err == nil {
-		var deploymentContext map[string]interface{}
-		if err := json.Unmarshal(deploymentContextData, &deploymentContext); err == nil {
-			if cluster, ok := deploymentContext["cluster"].(map[string]interface{}); ok {
-				if id, ok := cluster["id"].(string); ok {
-					clusterID = id
-				}
-			}
-		}
+	// Read cluster_id from environment variable
+	clusterID := os.Getenv("CLUSTER_ID")
+	if clusterID == "" {
+		clusterID = "na"
 	}
 
 	// Create labels
 	labels := map[string]interface{}{
 		"display_name":            plan.Name.ValueString(),
-		"resource_name":           plan.InstanceName.ValueString(),
-		"resource_kind":           resourceKind,
-		"environment_unique_name": envName,
+		"resource_name":           plan.FacetsResourceName.ValueString(),
+		"resource_kind":           facetsRes.Kind.ValueString(),
+		"environment_unique_name": facetsEnv.UniqueName.ValueString(),
 		"cluster_id":              clusterID,
 	}
 
@@ -300,60 +358,46 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 
 func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan TektonActionKubernetesResourceModel
+	var state TektonActionKubernetesResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
+	// Use state values for computed fields (StepActionName, TaskName)
+	// These are computed and unknown in the plan
+	plan.StepActionName = state.StepActionName
+	plan.TaskName = state.TaskName
+	plan.ID = state.ID
+
 	// Extract environment unique_name from environment object
-	var envMap map[string]interface{}
-	if err := json.Unmarshal([]byte(plan.Environment.String()), &envMap); err != nil {
-		resp.Diagnostics.AddError(
-			"Error parsing environment",
-			fmt.Sprintf("Could not parse environment object: %s", err.Error()),
-		)
+	var facetsEnv FacetsEnvironmentModel
+	resp.Diagnostics.Append(plan.FacetsEnvironment.As(ctx, &facetsEnv, basetypes.ObjectAsOptions{})...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	envName := ""
-	if uniqueName, ok := envMap["unique_name"].(string); ok {
-		envName = uniqueName
-	}
 
-	// Extract resource_kind from instance object
-	var instanceMap map[string]interface{}
-	if err := json.Unmarshal([]byte(plan.Instance.String()), &instanceMap); err != nil {
-		resp.Diagnostics.AddError(
-			"Error parsing instance",
-			fmt.Sprintf("Could not parse instance object: %s", err.Error()),
-		)
+	// Extract resource_kind from facets_resource object
+	var facetsRes FacetsResourceModel
+	resp.Diagnostics.Append(plan.FacetsResource.As(ctx, &facetsRes, basetypes.ObjectAsOptions{})...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	resourceKind := ""
-	if kind, ok := instanceMap["kind"].(string); ok {
-		resourceKind = kind
-	}
 
-	// Read deployment context for cluster_id
-	clusterID := ""
-	deploymentContextData, err := os.ReadFile("/sources/primary/capillary-cloud-tf/deploymentcontext.json")
-	if err == nil {
-		var deploymentContext map[string]interface{}
-		if err := json.Unmarshal(deploymentContextData, &deploymentContext); err == nil {
-			if cluster, ok := deploymentContext["cluster"].(map[string]interface{}); ok {
-				if id, ok := cluster["id"].(string); ok {
-					clusterID = id
-				}
-			}
-		}
+	// Read cluster_id from environment variable
+	clusterID := os.Getenv("CLUSTER_ID")
+	if clusterID == "" {
+		clusterID = "na"
 	}
 
 	// Create labels
 	labels := map[string]interface{}{
 		"display_name":            plan.Name.ValueString(),
-		"resource_name":           plan.InstanceName.ValueString(),
-		"resource_kind":           resourceKind,
-		"environment_unique_name": envName,
+		"resource_name":           plan.FacetsResourceName.ValueString(),
+		"resource_kind":           facetsRes.Kind.ValueString(),
+		"environment_unique_name": facetsEnv.UniqueName.ValueString(),
 		"cluster_id":              clusterID,
 	}
 
@@ -490,16 +534,36 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		})
 		tektonStep["env"] = envList
 
-		// Add resources if provided
+		// Add computeResources if provided
 		if !step.Resources.IsNull() {
-			// Resources is an object, convert to map
-			resourcesMap := step.Resources.Attributes()
-			if len(resourcesMap) > 0 {
-				resources := make(map[string]interface{})
-				for k, v := range resourcesMap {
-					resources[k] = v
+			var computeRes ComputeResourcesModel
+			diags := step.Resources.As(ctx, &computeRes, basetypes.ObjectAsOptions{})
+			if diags.HasError() {
+				// Skip this step's resources if conversion fails
+				// The error will be logged but won't fail the entire build
+				continue
+			}
+
+			computeResources := make(map[string]interface{})
+
+			if !computeRes.Requests.IsNull() {
+				requestsMap := make(map[string]string)
+				computeRes.Requests.ElementsAs(ctx, &requestsMap, false)
+				if len(requestsMap) > 0 {
+					computeResources["requests"] = requestsMap
 				}
-				tektonStep["resources"] = resources
+			}
+
+			if !computeRes.Limits.IsNull() {
+				limitsMap := make(map[string]string)
+				computeRes.Limits.ElementsAs(ctx, &limitsMap, false)
+				if len(limitsMap) > 0 {
+					computeResources["limits"] = limitsMap
+				}
+			}
+
+			if len(computeResources) > 0 {
+				tektonStep["computeResources"] = computeResources
 			}
 		}
 
@@ -518,14 +582,15 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		},
 	}
 
-	// Params can be any type, parse from dynamic
+	// Add user-defined params
 	if !plan.Params.IsNull() {
-		var params interface{}
-		if err := json.Unmarshal([]byte(plan.Params.String()), &params); err == nil {
-			// If params is a list, append each element
-			if paramsList, ok := params.([]interface{}); ok {
-				taskParams = append(taskParams, paramsList...)
-			}
+		var params []ParamModel
+		plan.Params.ElementsAs(ctx, &params, false)
+		for _, param := range params {
+			taskParams = append(taskParams, map[string]interface{}{
+				"name": param.Name.ValueString(),
+				"type": param.Type.ValueString(),
+			})
 		}
 	}
 
@@ -573,9 +638,43 @@ func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj
 		Resource: resource,
 	}
 
-	namespace := obj.GetNamespace()
-	_, err := r.client.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+	// DEBUG: Try to see what we have
+	metadata, hasMetadata := obj.Object["metadata"]
+	if !hasMetadata {
+		return fmt.Errorf("no metadata key in object")
+	}
+
+	metadataMap, isMap := metadata.(map[string]interface{})
+	if !isMap {
+		return fmt.Errorf("metadata is not a map: %T", metadata)
+	}
+
+	namespace, hasNS := metadataMap["namespace"].(string)
+	name, hasName := metadataMap["name"].(string)
+
+	if !hasNS || !hasName || namespace == "" || name == "" {
+		return fmt.Errorf("missing name/namespace: hasNS=%v ns=%s, hasName=%v name=%s, metadata=%+v", hasNS, namespace, hasName, name, metadataMap)
+	}
+
+	// Get current resource to preserve resourceVersion
+	current, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get current resource %s/%s: %w", namespace, name, err)
+	}
+
+	// Preserve resourceVersion for optimistic locking
+	obj.SetResourceVersion(current.GetResourceVersion())
+
+	_, err = r.client.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	return err
+}
+
+func keysOf(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (r *TektonActionKubernetesResource) deleteResource(ctx context.Context, namespace, name, group, version, resource string) error {

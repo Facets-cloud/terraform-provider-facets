@@ -21,6 +21,10 @@ go.work
 .terraform.lock.hcl
 crash.log
 
+# Test artifacts (keep root clean)
+/test.tf
+/main.tf.example
+
 # IDE
 .idea/
 .vscode/

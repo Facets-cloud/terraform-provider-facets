@@ -1,11 +1,15 @@
 # Terraform Provider for Facets
 
-This Terraform provider implements resources for managing Facets infrastructure, specifically Tekton Tasks and StepActions for Kubernetes-based workflows.
+The Facets Terraform Provider allows you to manage Tekton-based Kubernetes workflows integrated with the Facets platform.
 
 ## Features
 
+- 🚀 **Automated Credential Management** - Kubernetes credentials are automatically injected based on user RBAC
+- 🔧 **Simple Configuration** - Define workflows using familiar Terraform syntax
+- 🎯 **Tekton Integration** - Creates Tekton Tasks and StepActions automatically
+- 📊 **Blueprint Mapping** - Seamlessly maps to Facets blueprint resources
+- 🔐 **RBAC-Scoped** - User permissions enforced automatically
 - **In-cluster Kubernetes authentication priority**: Automatically uses service account tokens when running in a Kubernetes cluster
-- **Tekton Task management**: Create and manage Tekton Tasks with custom steps and parameters
 - **No submodule dependency bloat**: Direct resource implementation avoids dependency issues from nested submodules
 
 ## Authentication Priority
@@ -18,6 +22,21 @@ The provider uses the following priority order for Kubernetes authentication:
 
 This ensures that when running inside a Kubernetes cluster, the provider automatically uses the mounted service account token.
 
+## How It Works
+
+When a user triggers an action via the Facets UI:
+
+1. **Facets UI** provides user's kubeconfig (base64-encoded) as `FACETS_USER_KUBECONFIG` parameter
+2. **Credential Setup** step automatically decodes and configures kubectl access
+3. **Your Steps** execute with kubectl configured according to user's RBAC permissions
+4. **Labels** track the action back to Facets blueprint resources
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CLUSTER_ID` | No | `"na"` | Cluster identifier for resource labeling |
+
 ## Resources
 
 ### `facets_tekton_action_kubernetes`
@@ -28,19 +47,28 @@ Creates a Tekton Task and StepAction for Kubernetes-based workflows.
 
 - `name` (String, Required): Display name of the Tekton Task
 - `description` (String, Optional): Description of the Tekton Task
-- `instance_name` (String, Required): Resource instance name
-- `environment` (Dynamic, Required): Environment object (any type)
-- `instance` (Dynamic, Required): Instance object (any type)
+- `facets_resource_name` (String, Required): Resource name as defined in the Facets blueprint
+- `facets_environment` (Object, Required): Facets-managed environment configuration
+  - `unique_name` (String, Required): Unique name of the environment
+- `facets_resource` (Object, Required): Resource definition as specified in the Facets blueprint
+  - `kind` (String, Required): Resource kind
+  - `flavor` (String, Required): Resource flavor
+  - `version` (String, Required): Resource version
+  - `spec` (Dynamic, Required): Additional resource specifications
 - `namespace` (String, Optional): Kubernetes namespace for Tekton resources (default: "tekton-pipelines")
 - `steps` (List of Objects, Required): List of steps for the Tekton Task
   - `name` (String, Required): Step name
   - `image` (String, Required): Container image for the step
   - `script` (String, Required): Script to execute in the step
-  - `resources` (Dynamic, Required): Resource requests and limits (any type)
+  - `resources` (Object, Optional): Compute resources for the step
+    - `requests` (Map of Strings, Optional): Minimum compute resources (e.g., cpu, memory)
+    - `limits` (Map of Strings, Optional): Maximum compute resources
   - `env` (List of Objects, Optional): Environment variables for the step
     - `name` (String, Required): Environment variable name
     - `value` (String, Required): Environment variable value
-- `params` (Dynamic, Optional): List of params for the Tekton Task (any type)
+- `params` (List of Objects, Optional): List of custom parameters for the Tekton Task
+  - `name` (String, Required): Parameter name
+  - `type` (String, Required): Parameter type (e.g., "string", "array")
 
 #### Computed Attributes
 
@@ -62,23 +90,26 @@ terraform {
 provider "facets" {}
 
 resource "facets_tekton_action_kubernetes" "rollout_restart" {
-  name          = "rollout-restart"
-  description   = "Rollout restart deployments in Kubernetes"
-  instance_name = "my-service"
+  name                 = "rollout-restart"
+  description          = "Rollout restart deployments in Kubernetes"
+  facets_resource_name = "my-service"
 
-  environment = {
+  facets_environment = {
     unique_name = "production"
   }
 
-  instance = {
-    kind = "service"
+  facets_resource = {
+    kind    = "service"
+    flavor  = "k8s"
+    version = "1.0"
+    spec    = {}
   }
 
   steps = [
     {
       name  = "restart-deployments"
       image = "bitnami/kubectl:latest"
-      resources = {}
+
       env = [
         {
           name  = "RESOURCE_TYPE"
@@ -116,20 +147,28 @@ resource "facets_tekton_action_kubernetes" "rollout_restart" {
     }
   ]
 
-  params = [
-    {
-      name = "CUSTOM_PARAM"
-      type = "string"
-      description = "A custom parameter"
-      default = "default-value"
-    }
-  ]
-}
-
-output "task_name" {
-  value = facets_tekton_action_kubernetes.rollout_restart.task_name
 }
 ```
+
+For more detailed documentation and additional examples, see:
+- [Resource Documentation](docs/resources/tekton_action_kubernetes.md)
+- [Examples Directory](examples/)
+
+## Auto-Injected Parameters
+
+Every Tekton Task automatically includes these parameters (no need to define them):
+
+- `FACETS_USER_EMAIL` - Email of the user triggering the action
+- `FACETS_USER_KUBECONFIG` - Base64-encoded kubeconfig with RBAC permissions
+
+These parameters are populated by the Facets UI when the action is triggered.
+
+## Auto-Generated Steps
+
+A `setup-credentials` step is automatically prepended to your workflow that:
+- Decodes the base64-encoded kubeconfig
+- Places it at `/workspace/.kube/config`
+- Sets `KUBECONFIG` environment variable for all steps
 
 ## Installation
 
