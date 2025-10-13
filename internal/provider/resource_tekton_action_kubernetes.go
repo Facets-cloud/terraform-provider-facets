@@ -148,7 +148,7 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					},
 					"version": schema.StringAttribute{
 						Description: "Resource version",
-						Required:    true,
+						Required:    false,
 					},
 					"spec": schema.DynamicAttribute{
 						Description: "Resource specification (any type)",
