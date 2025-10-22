@@ -16,7 +16,7 @@ NC='\033[0m' # No Color
 PROVIDER_VERSION="99.0.0-local"
 PROVIDER_NAME="terraform-provider-facets"
 TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$TEST_DIR/../.." && pwd)"
+PROJECT_ROOT="$(cd "$TEST_DIR/../../.." && pwd)"
 CLUSTER_ID="${CLUSTER_ID:-integration-test-cluster}"
 
 echo -e "${BLUE}========================================${NC}"
