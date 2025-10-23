@@ -601,7 +601,7 @@ func generateAWSResourceNames(resourceName, envName, displayName string) (string
 	return taskName, stepActionName
 }
 
-// buildAWSStepAction creates the StepAction for AWS credential setup with hardcoded credentials
+// buildAWSStepAction creates the StepAction for AWS credential setup
 func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan TektonActionAWSResourceModel, labels map[string]interface{}) (*unstructured.Unstructured, error) {
 	// Convert provider data to aws.ProviderModel for extraction
 	awsProviderModel := &aws.ProviderModel{
@@ -614,38 +614,15 @@ func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan T
 		return nil, fmt.Errorf("failed to get AWS config: %w", err)
 	}
 
-	// Build script with hardcoded credential values
-	script := fmt.Sprintf(`#!/bin/bash
-set -e
-
-# Create AWS config directory
-mkdir -p /workspace/.aws
-
-# Write credentials file (values hardcoded at StepAction creation time)
-cat > /workspace/.aws/credentials <<EOF
-[default]
-aws_access_key_id = %s
-aws_secret_access_key = %s
-EOF
-
-# Write config file (region hardcoded at StepAction creation time)
-cat > /workspace/.aws/config <<EOF
-[default]
-region = %s
-EOF
-
-# Set permissions
-chmod 600 /workspace/.aws/credentials
-chmod 600 /workspace/.aws/config
-
-# Export file paths for AWS CLI/SDK
-export AWS_CONFIG_FILE=/workspace/.aws/config
-export AWS_SHARED_CREDENTIALS_FILE=/workspace/.aws/credentials
-`,
-		awsConfig.AccessKey.ValueString(),
-		awsConfig.SecretKey.ValueString(),
-		awsConfig.Region.ValueString(),
-	)
+	// Generate appropriate script based on auth type
+	var script string
+	if awsConfig.AssumeRoleConfig != nil {
+		// Use assume role script (always uses ambient credentials - no base credentials needed)
+		script = generateAssumeRoleScript(awsConfig)
+	} else {
+		// Use inline credentials script
+		script = generateInlineCredentialsScript(awsConfig)
+	}
 
 	stepAction := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -659,13 +636,170 @@ export AWS_SHARED_CREDENTIALS_FILE=/workspace/.aws/credentials
 			"spec": map[string]interface{}{
 				"image":  "facetscloud/actions-base-image:v1.0.0",
 				"script": script,
-				// No params needed - credentials are hardcoded in script
+				// No params needed - credentials are hardcoded in script or use ambient
 				// No env vars needed - everything is in the script
 			},
 		},
 	}
 
 	return stepAction, nil
+}
+
+// generateInlineCredentialsScript creates a script for static AWS credentials
+// This script hardcodes the access key and secret key at StepAction creation time
+func generateInlineCredentialsScript(config *aws.AWSAuthConfig) string {
+	if config.InlineCredentials == nil {
+		return ""
+	}
+
+	return fmt.Sprintf(`#!/bin/bash
+set -e
+
+echo "Setting up AWS credentials (inline)"
+
+# Create AWS config directory
+mkdir -p /workspace/.aws
+
+# Write credentials file (values hardcoded at StepAction creation time)
+cat > /workspace/.aws/credentials <<'EOF'
+[default]
+aws_access_key_id = %s
+aws_secret_access_key = %s
+EOF
+
+# Write config file (region hardcoded at StepAction creation time)
+cat > /workspace/.aws/config <<'EOF'
+[default]
+region = %s
+EOF
+
+# Set permissions
+chmod 600 /workspace/.aws/credentials
+chmod 600 /workspace/.aws/config
+
+echo "AWS credentials configured successfully"
+`,
+		config.InlineCredentials.AccessKey,
+		config.InlineCredentials.SecretKey,
+		config.Region,
+	)
+}
+
+// generateAssumeRoleScript creates a script that assumes an IAM role at runtime
+// Uses ambient/pod credentials (IRSA) to assume the role - no base credentials needed
+func generateAssumeRoleScript(config *aws.AWSAuthConfig) string {
+	if config.AssumeRoleConfig == nil {
+		return ""
+	}
+
+	assumeRole := config.AssumeRoleConfig
+
+	// Build the aws sts assume-role command with optional parameters
+	assumeRoleCmd := fmt.Sprintf(`aws sts assume-role \
+  --role-arn "%s" \
+  --role-session-name "%s"`,
+		assumeRole.RoleARN,
+		assumeRole.SessionName,
+	)
+
+	// Add optional external_id if provided
+	if assumeRole.ExternalID != "" {
+		assumeRoleCmd += fmt.Sprintf(` \
+  --external-id "%s"`, assumeRole.ExternalID)
+	}
+
+	// Add duration
+	assumeRoleCmd += fmt.Sprintf(` \
+  --duration-seconds %d \
+  --output json`, assumeRole.Duration)
+
+	// Always use ambient credentials (IRSA) - no base credentials needed
+	return fmt.Sprintf(`#!/bin/bash
+set -e
+
+echo "Setting up AWS credentials (assume role with ambient/pod credentials)"
+
+# Create AWS config directory
+mkdir -p /workspace/.aws
+
+# Create config file (region only, no credentials needed - using ambient auth)
+cat > /workspace/.aws/config <<'EOF'
+[default]
+region = %s
+EOF
+
+chmod 600 /workspace/.aws/config
+
+# Pod already has IAM permissions via IRSA to assume the target role
+# AWS CLI will use ambient credentials to assume the role
+
+echo "==========================================="
+echo "DEBUG: Assuming IAM role: %s (using ambient pod credentials)"
+echo "DEBUG: Checking for ambient credentials..."
+env | grep -E '^AWS_' || echo "No AWS environment variables found"
+echo "DEBUG: Command to execute:"
+echo "%s"
+echo "==========================================="
+
+# Assume the role and get temporary credentials
+set +e  # Temporarily disable exit on error to capture output
+ASSUME_ROLE_OUTPUT=$(%s 2>&1)
+ASSUME_ROLE_EXIT_CODE=$?
+set -e  # Re-enable exit on error
+
+echo "==========================================="
+echo "DEBUG: AWS STS AssumeRole Exit Code: $ASSUME_ROLE_EXIT_CODE"
+echo "DEBUG: Full AWS STS Response:"
+echo "$ASSUME_ROLE_OUTPUT"
+echo "==========================================="
+
+# Check if assume role succeeded
+if [ $ASSUME_ROLE_EXIT_CODE -ne 0 ]; then
+  echo "ERROR: Failed to assume role (exit code: $ASSUME_ROLE_EXIT_CODE)"
+  echo "Ensure the pod has IAM permissions to assume this role"
+  echo "Required: IRSA (EKS) with permissions to assume the target role"
+  exit 1
+fi
+
+# Extract temporary credentials using jq
+echo "DEBUG: Extracting credentials using jq..."
+AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
+AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
+AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
+EXPIRATION=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.Expiration')
+
+echo "DEBUG: Extracted values:"
+echo "  AccessKeyId: ${AWS_ACCESS_KEY_ID:0:10}... (truncated)"
+echo "  SecretAccessKey: [REDACTED]"
+echo "  SessionToken: ${AWS_SESSION_TOKEN:0:20}... (truncated)"
+echo "  Expiration: $EXPIRATION"
+
+# Validate that credentials were extracted
+if [ -z "$AWS_ACCESS_KEY_ID" ] || [ "$AWS_ACCESS_KEY_ID" == "null" ]; then
+  echo "ERROR: Failed to extract temporary credentials from STS response"
+  echo "AccessKeyId extracted: '$AWS_ACCESS_KEY_ID'"
+  exit 1
+fi
+
+echo "Successfully assumed role. Credentials expire at: $EXPIRATION"
+
+# Write temporary credentials to file
+cat > /workspace/.aws/credentials <<EOF
+[default]
+aws_access_key_id = $AWS_ACCESS_KEY_ID
+aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
+aws_session_token = $AWS_SESSION_TOKEN
+EOF
+
+chmod 600 /workspace/.aws/credentials
+
+echo "AWS temporary credentials configured successfully"
+`,
+		config.Region,
+		assumeRole.RoleARN,
+		assumeRoleCmd,
+		assumeRoleCmd,
+	)
 }
 
 // buildAWSTask creates the Tekton Task for AWS workflows
@@ -706,7 +840,23 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 				"value": env.Value.ValueString(),
 			})
 		}
-		// Inject AWS environment variables (file-based only)
+
+		// Disable IRSA by overriding with empty values
+		// This forces AWS SDK to use credential files instead of IRSA
+		envList = append(envList, map[string]interface{}{
+			"name":  "AWS_WEB_IDENTITY_TOKEN_FILE",
+			"value": "",
+		})
+		envList = append(envList, map[string]interface{}{
+			"name":  "AWS_ROLE_ARN",
+			"value": "",
+		})
+		envList = append(envList, map[string]interface{}{
+			"name":  "AWS_STS_REGIONAL_ENDPOINTS",
+			"value": "",
+		})
+
+		// Inject AWS environment variables (file-based credentials)
 		envList = append(envList, map[string]interface{}{
 			"name":  "AWS_CONFIG_FILE",
 			"value": "/workspace/.aws/config",
