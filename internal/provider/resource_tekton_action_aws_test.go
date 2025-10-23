@@ -1,7 +1,10 @@
 package provider
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
 )
 
 func TestGenerateAWSResourceNames(t *testing.T) {
@@ -124,4 +127,203 @@ func containsString(slice []string, str string) bool {
 		}
 	}
 	return false
+}
+
+// Test script generation for inline credentials
+func TestGenerateInlineCredentialsScript(t *testing.T) {
+	config := &aws.AWSAuthConfig{
+		Region: "us-west-2",
+		InlineCredentials: &aws.InlineCredentials{
+			AccessKey: "AKIAIOSFODNN7EXAMPLE",
+			SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		},
+	}
+
+	script := generateInlineCredentialsScript(config)
+
+	// Validate script contains expected elements
+	if !strings.Contains(script, "#!/bin/bash") {
+		t.Error("Script missing shebang")
+	}
+	if !strings.Contains(script, "set -e") {
+		t.Error("Script missing error handling")
+	}
+	if !strings.Contains(script, "mkdir -p /workspace/.aws") {
+		t.Error("Script missing directory creation")
+	}
+	if !strings.Contains(script, "AKIAIOSFODNN7EXAMPLE") {
+		t.Error("Script missing access key")
+	}
+	if !strings.Contains(script, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") {
+		t.Error("Script missing secret key")
+	}
+	if !strings.Contains(script, "region = us-west-2") {
+		t.Error("Script missing region")
+	}
+	if !strings.Contains(script, "chmod 600") {
+		t.Error("Script missing permissions setting")
+	}
+	if !strings.Contains(script, "AWS_CONFIG_FILE") {
+		t.Error("Script missing AWS_CONFIG_FILE export")
+	}
+	if !strings.Contains(script, "AWS_SHARED_CREDENTIALS_FILE") {
+		t.Error("Script missing AWS_SHARED_CREDENTIALS_FILE export")
+	}
+}
+
+// Test script generation for assume role
+func TestGenerateAssumeRoleScript(t *testing.T) {
+	config := &aws.AWSAuthConfig{
+		Region: "us-east-1",
+		AssumeRoleConfig: &aws.AssumeRoleConfig{
+			RoleARN:     "arn:aws:iam::123456789012:role/my-role",
+			SessionName: "test-session",
+			ExternalID:  "my-external-id",
+			Duration:    3600,
+			BaseCredentials: &aws.InlineCredentials{
+				AccessKey: "AKIAIOSFODNN7EXAMPLE",
+				SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+			},
+		},
+	}
+
+	script := generateAssumeRoleScript(config)
+
+	// Validate script contains expected elements
+	if !strings.Contains(script, "#!/bin/bash") {
+		t.Error("Script missing shebang")
+	}
+	if !strings.Contains(script, "set -e") {
+		t.Error("Script missing error handling")
+	}
+	if !strings.Contains(script, "assume role") {
+		t.Error("Script missing assume role message")
+	}
+	if !strings.Contains(script, "AKIAIOSFODNN7EXAMPLE") {
+		t.Error("Script missing base access key")
+	}
+	if !strings.Contains(script, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") {
+		t.Error("Script missing base secret key")
+	}
+	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
+		t.Error("Script missing role ARN")
+	}
+	if !strings.Contains(script, "--role-session-name \"test-session\"") {
+		t.Error("Script missing session name")
+	}
+	if !strings.Contains(script, "--external-id \"my-external-id\"") {
+		t.Error("Script missing external ID")
+	}
+	if !strings.Contains(script, "--duration-seconds 3600") {
+		t.Error("Script missing duration")
+	}
+	if !strings.Contains(script, "aws sts assume-role") {
+		t.Error("Script missing AWS STS assume-role command")
+	}
+	if !strings.Contains(script, "jq -r '.Credentials.AccessKeyId'") {
+		t.Error("Script missing credential extraction with jq")
+	}
+	if !strings.Contains(script, "aws_session_token") {
+		t.Error("Script missing session token")
+	}
+	if !strings.Contains(script, "chmod 600") {
+		t.Error("Script missing permissions setting")
+	}
+}
+
+// Test assume role script without external ID
+func TestGenerateAssumeRoleScriptWithoutExternalID(t *testing.T) {
+	config := &aws.AWSAuthConfig{
+		Region: "us-east-1",
+		AssumeRoleConfig: &aws.AssumeRoleConfig{
+			RoleARN:     "arn:aws:iam::123456789012:role/my-role",
+			SessionName: "test-session",
+			ExternalID:  "", // No external ID
+			Duration:    7200,
+			BaseCredentials: &aws.InlineCredentials{
+				AccessKey: "AKIAIOSFODNN7EXAMPLE",
+				SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+			},
+		},
+	}
+
+	script := generateAssumeRoleScript(config)
+
+	// Validate external_id is NOT in the command when empty
+	if strings.Contains(script, "--external-id \"\"") {
+		t.Error("Script should not include empty external-id flag")
+	}
+
+	// But should still contain other elements
+	if !strings.Contains(script, "aws sts assume-role") {
+		t.Error("Script missing AWS STS assume-role command")
+	}
+	if !strings.Contains(script, "--duration-seconds 7200") {
+		t.Error("Script has wrong duration")
+	}
+}
+
+// Test assume role script with ambient/pod credentials (no base credentials)
+func TestGenerateAssumeRoleScriptWithAmbientCredentials(t *testing.T) {
+	config := &aws.AWSAuthConfig{
+		Region: "us-east-1",
+		AssumeRoleConfig: &aws.AssumeRoleConfig{
+			RoleARN:         "arn:aws:iam::123456789012:role/my-role",
+			SessionName:     "test-session",
+			ExternalID:      "external-123",
+			Duration:        3600,
+			BaseCredentials: nil, // No base credentials - using ambient/pod credentials
+		},
+	}
+
+	script := generateAssumeRoleScript(config)
+
+	// Should contain ambient credential message
+	if !strings.Contains(script, "ambient/pod credentials") {
+		t.Error("Script missing ambient credentials message")
+	}
+
+	// Should NOT hardcode credentials in a heredoc (base credentials section)
+	// The script does write temporary credentials to a file, but that's from STS response
+	if strings.Contains(script, "aws_access_key_id = AKIA") {
+		t.Error("Script should not hardcode static credentials when using ambient auth")
+	}
+
+	// Should still call assume-role
+	if !strings.Contains(script, "aws sts assume-role") {
+		t.Error("Script missing AWS STS assume-role command")
+	}
+
+	// Should have role ARN
+	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
+		t.Error("Script missing role ARN")
+	}
+
+	// Should have external ID
+	if !strings.Contains(script, "--external-id \"external-123\"") {
+		t.Error("Script missing external ID")
+	}
+
+	// Should create config file with region only
+	if !strings.Contains(script, "region = us-east-1") {
+		t.Error("Script missing region in config")
+	}
+
+	// Should export credential paths after assuming role
+	if !strings.Contains(script, "export AWS_CONFIG_FILE") {
+		t.Error("Script missing AWS_CONFIG_FILE export")
+	}
+}
+
+// Test script generation returns empty for nil configs
+func TestGenerateScriptWithNilConfig(t *testing.T) {
+	inlineScript := generateInlineCredentialsScript(&aws.AWSAuthConfig{})
+	if inlineScript != "" {
+		t.Error("Expected empty script for nil InlineCredentials")
+	}
+
+	assumeRoleScript := generateAssumeRoleScript(&aws.AWSAuthConfig{})
+	if assumeRoleScript != "" {
+		t.Error("Expected empty script for nil AssumeRoleConfig")
+	}
 }
