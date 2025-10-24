@@ -717,8 +717,6 @@ func generateAssumeRoleScript(config *aws.AWSAuthConfig) string {
 	return fmt.Sprintf(`#!/bin/bash
 set -e
 
-echo "Setting up AWS credentials (assume role with ambient/pod credentials)"
-
 # Create AWS config directory
 mkdir -p /workspace/.aws
 
@@ -730,58 +728,18 @@ EOF
 
 chmod 600 /workspace/.aws/config
 
-# Pod already has IAM permissions via IRSA to assume the target role
-# AWS CLI will use ambient credentials to assume the role
-
-echo "==========================================="
-echo "DEBUG: Assuming IAM role: %s (using ambient pod credentials)"
-echo "DEBUG: Checking for ambient credentials..."
-env | grep -E '^AWS_' || echo "No AWS environment variables found"
-echo "DEBUG: Command to execute:"
-echo "%s"
-echo "==========================================="
-
 # Assume the role and get temporary credentials
-set +e  # Temporarily disable exit on error to capture output
-ASSUME_ROLE_OUTPUT=$(%s 2>&1)
-ASSUME_ROLE_EXIT_CODE=$?
-set -e  # Re-enable exit on error
-
-echo "==========================================="
-echo "DEBUG: AWS STS AssumeRole Exit Code: $ASSUME_ROLE_EXIT_CODE"
-echo "DEBUG: Full AWS STS Response:"
-echo "$ASSUME_ROLE_OUTPUT"
-echo "==========================================="
-
-# Check if assume role succeeded
-if [ $ASSUME_ROLE_EXIT_CODE -ne 0 ]; then
-  echo "ERROR: Failed to assume role (exit code: $ASSUME_ROLE_EXIT_CODE)"
-  echo "Ensure the pod has IAM permissions to assume this role"
-  echo "Required: IRSA (EKS) with permissions to assume the target role"
-  exit 1
-fi
+ASSUME_ROLE_OUTPUT=$(%s)
 
 # Extract temporary credentials using jq
-echo "DEBUG: Extracting credentials using jq..."
 AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
 AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
 AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
-EXPIRATION=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.Expiration')
-
-echo "DEBUG: Extracted values:"
-echo "  AccessKeyId: ${AWS_ACCESS_KEY_ID:0:10}... (truncated)"
-echo "  SecretAccessKey: [REDACTED]"
-echo "  SessionToken: ${AWS_SESSION_TOKEN:0:20}... (truncated)"
-echo "  Expiration: $EXPIRATION"
 
 # Validate that credentials were extracted
 if [ -z "$AWS_ACCESS_KEY_ID" ] || [ "$AWS_ACCESS_KEY_ID" == "null" ]; then
-  echo "ERROR: Failed to extract temporary credentials from STS response"
-  echo "AccessKeyId extracted: '$AWS_ACCESS_KEY_ID'"
   exit 1
 fi
-
-echo "Successfully assumed role. Credentials expire at: $EXPIRATION"
 
 # Write temporary credentials to file
 cat > /workspace/.aws/credentials <<EOF
@@ -792,12 +750,8 @@ aws_session_token = $AWS_SESSION_TOKEN
 EOF
 
 chmod 600 /workspace/.aws/credentials
-
-echo "AWS temporary credentials configured successfully"
 `,
 		config.Region,
-		assumeRole.RoleARN,
-		assumeRoleCmd,
 		assumeRoleCmd,
 	)
 }
