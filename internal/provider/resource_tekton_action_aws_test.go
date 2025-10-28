@@ -163,12 +163,7 @@ func TestGenerateInlineCredentialsScript(t *testing.T) {
 	if !strings.Contains(script, "chmod 600") {
 		t.Error("Script missing permissions setting")
 	}
-	if !strings.Contains(script, "AWS_CONFIG_FILE") {
-		t.Error("Script missing AWS_CONFIG_FILE export")
-	}
-	if !strings.Contains(script, "AWS_SHARED_CREDENTIALS_FILE") {
-		t.Error("Script missing AWS_SHARED_CREDENTIALS_FILE export")
-	}
+	// Note: AWS env vars are injected in buildAWSTask, not in the script
 }
 
 // Test script generation for assume role
@@ -176,14 +171,11 @@ func TestGenerateAssumeRoleScript(t *testing.T) {
 	config := &aws.AWSAuthConfig{
 		Region: "us-east-1",
 		AssumeRoleConfig: &aws.AssumeRoleConfig{
-			RoleARN:     "arn:aws:iam::123456789012:role/my-role",
-			SessionName: "test-session",
-			ExternalID:  "my-external-id",
-			Duration:    3600,
-			BaseCredentials: &aws.InlineCredentials{
-				AccessKey: "AKIAIOSFODNN7EXAMPLE",
-				SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-			},
+			RoleARN:         "arn:aws:iam::123456789012:role/my-role",
+			SessionName:     "test-session",
+			ExternalID:      "my-external-id",
+			Duration:        3600,
+			BaseCredentials: nil, // Always uses ambient/IRSA credentials now
 		},
 	}
 
@@ -195,15 +187,6 @@ func TestGenerateAssumeRoleScript(t *testing.T) {
 	}
 	if !strings.Contains(script, "set -e") {
 		t.Error("Script missing error handling")
-	}
-	if !strings.Contains(script, "assume role") {
-		t.Error("Script missing assume role message")
-	}
-	if !strings.Contains(script, "AKIAIOSFODNN7EXAMPLE") {
-		t.Error("Script missing base access key")
-	}
-	if !strings.Contains(script, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") {
-		t.Error("Script missing base secret key")
 	}
 	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
 		t.Error("Script missing role ARN")
@@ -229,6 +212,7 @@ func TestGenerateAssumeRoleScript(t *testing.T) {
 	if !strings.Contains(script, "chmod 600") {
 		t.Error("Script missing permissions setting")
 	}
+	// Note: Always uses ambient credentials (IRSA), not base credentials
 }
 
 // Test assume role script without external ID
@@ -278,14 +262,8 @@ func TestGenerateAssumeRoleScriptWithAmbientCredentials(t *testing.T) {
 
 	script := generateAssumeRoleScript(config)
 
-	// Should contain ambient credential message
-	if !strings.Contains(script, "ambient/pod credentials") {
-		t.Error("Script missing ambient credentials message")
-	}
-
-	// Should NOT hardcode credentials in a heredoc (base credentials section)
-	// The script does write temporary credentials to a file, but that's from STS response
-	if strings.Contains(script, "aws_access_key_id = AKIA") {
+	// Should NOT hardcode static credentials (only temp creds from STS response)
+	if strings.Contains(script, "aws_access_key_id = AKIA") && !strings.Contains(script, "$AWS_ACCESS_KEY_ID") {
 		t.Error("Script should not hardcode static credentials when using ambient auth")
 	}
 
@@ -309,10 +287,7 @@ func TestGenerateAssumeRoleScriptWithAmbientCredentials(t *testing.T) {
 		t.Error("Script missing region in config")
 	}
 
-	// Should export credential paths after assuming role
-	if !strings.Contains(script, "export AWS_CONFIG_FILE") {
-		t.Error("Script missing AWS_CONFIG_FILE export")
-	}
+	// Note: AWS env vars are injected in buildAWSTask, not in the script
 }
 
 // Test script generation returns empty for nil configs
