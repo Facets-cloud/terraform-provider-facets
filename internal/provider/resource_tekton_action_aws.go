@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
@@ -769,12 +770,18 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 			"ref": map[string]interface{}{
 				"name": plan.StepActionName.ValueString(),
 			},
-			// No params needed - credentials are hardcoded in StepAction
 		},
 	}
 
+	// Collect user step container names for skip-containers annotation
+	// User steps should NOT receive IRSA injection - they get credentials via files
+	// Tekton prefixes step names with "step-" for container names
+	userStepContainerNames := []string{}
+
 	// Add user-defined steps
 	for _, step := range steps {
+		stepName := step.Name.ValueString()
+		userStepContainerNames = append(userStepContainerNames, "step-"+stepName)
 		tektonStep := map[string]interface{}{
 			"name":   step.Name.ValueString(),
 			"image":  step.Image.ValueString(),
@@ -794,21 +801,6 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 				"value": env.Value.ValueString(),
 			})
 		}
-
-		// Disable IRSA by overriding with empty values
-		// This forces AWS SDK to use credential files instead of IRSA
-		envList = append(envList, map[string]interface{}{
-			"name":  "AWS_WEB_IDENTITY_TOKEN_FILE",
-			"value": "",
-		})
-		envList = append(envList, map[string]interface{}{
-			"name":  "AWS_ROLE_ARN",
-			"value": "",
-		})
-		envList = append(envList, map[string]interface{}{
-			"name":  "AWS_STS_REGIONAL_ENDPOINTS",
-			"value": "",
-		})
 
 		// Inject AWS environment variables (file-based credentials)
 		envList = append(envList, map[string]interface{}{
@@ -877,15 +869,29 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		description = plan.Description.ValueString()
 	}
 
+	// Build task metadata
+	metadata := map[string]interface{}{
+		"name":      plan.TaskName.ValueString(),
+		"namespace": plan.Namespace.ValueString(),
+		"labels":    labels,
+	}
+
+	// Add skip-containers annotation to Task metadata
+	// Annotations propagate from Task → TaskRun → Pod in Tekton
+	// User steps receive credentials via files, not IRSA, so exclude them from IRSA injection
+	if len(userStepContainerNames) > 0 {
+		skipContainers := strings.Join(userStepContainerNames, ",")
+		metadata["annotations"] = map[string]string{
+			"eks.amazonaws.com/skip-containers": skipContainers,
+		}
+	}
+
+	// Build task object using unstructured (idiomatic for dynamic K8s resources)
 	task := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "tekton.dev/v1beta1",
 			"kind":       "Task",
-			"metadata": map[string]interface{}{
-				"name":      plan.TaskName.ValueString(),
-				"namespace": plan.Namespace.ValueString(),
-				"labels":    labels,
-			},
+			"metadata":   metadata,
 			"spec": map[string]interface{}{
 				"description": description,
 				"steps":       tektonSteps,
