@@ -21,10 +21,7 @@ resource "facets_tekton_action_kubernetes" "hello" {
   }
 
   facets_resource = {
-    kind    = "application"
-    flavor  = "k8s"
-    version = "1.0"
-    spec    = {}
+    kind = "application"
   }
 
   steps = [

@@ -53,10 +53,7 @@ type FacetsEnvironmentModel struct {
 }
 
 type FacetsResourceModel struct {
-	Kind    types.String  `tfsdk:"kind"`
-	Flavor  types.String  `tfsdk:"flavor"`
-	Version types.String  `tfsdk:"version"`
-	Spec    types.Dynamic `tfsdk:"spec"`
+	Kind types.String `tfsdk:"kind"`
 }
 
 type ParamModel struct {
@@ -135,23 +132,12 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 			},
 			"facets_resource": schema.SingleNestedAttribute{
 				Description: "Resource definition as specified in the Facets blueprint. " +
-					"Used to map the Tekton task back to the blueprint resource in Facets.",
+					"Only the 'kind' field is used by the provider (in resource labels). " +
+					"Other fields like 'flavor', 'version', and 'spec' can be provided but are silently ignored.",
 				Required: true,
 				Attributes: map[string]schema.Attribute{
 					"kind": schema.StringAttribute{
-						Description: "Resource kind",
-						Required:    true,
-					},
-					"flavor": schema.StringAttribute{
-						Description: "Resource flavor",
-						Required:    true,
-					},
-					"version": schema.StringAttribute{
-						Description: "Resource version",
-						Required:    true,
-					},
-					"spec": schema.DynamicAttribute{
-						Description: "Resource specification (any type)",
+						Description: "Resource kind (used in resource labels)",
 						Required:    true,
 					},
 				},
