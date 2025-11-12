@@ -4,71 +4,45 @@ Manages a Tekton Task and StepAction for AWS-based workflows in Facets.
 
 This resource automatically creates:
 - A Tekton Task with your specified workflow steps
-- A StepAction that sets up AWS credentials automatically
+- A StepAction that sets up AWS credentials using IRSA role chaining
 
 ## How It Works
 
-The `facets_tekton_action_aws` resource provides automatic AWS credential management through two authentication methods:
+The `facets_tekton_action_aws` resource provides automatic AWS credential management through **IRSA (IAM Roles for Service Accounts)** with native AWS SDK role chaining.
 
-### Inline Credentials (Static)
+### IRSA Role Chaining Flow
 
-When you configure the provider with inline AWS credentials:
+1. **Configuration**: Pod's ServiceAccount has an IRSA role with `sts:AssumeRole` permission
+2. **Setup Step**: Creates AWS config file with `source_profile` pointing to IRSA credentials
+3. **User Steps**: AWS SDK automatically:
+   - Reads IRSA credentials from environment variables
+   - Uses them to call `sts:AssumeRole` on the target role
+   - Caches and auto-refreshes temporary credentials
+   - All transparent to user workflows
 
-1. **Credential Embedding**: Static AWS credentials (access key, secret key) are embedded directly into the StepAction script at Terraform apply time
-2. **Runtime Execution**: When triggered via Facets UI:
-   - The StepAction runs and creates `~/.aws/credentials` and `~/.aws/config` files
-   - AWS environment variables (`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`) are automatically injected into all user steps
-   - Your workflow steps execute with AWS CLI/SDK access via credential files
-3. **IRSA Isolation**: If running in EKS with IRSA enabled, the Task includes a `skip-containers` annotation to prevent IRSA injection into user steps, ensuring they use the credential files instead
+### Authentication Flow
 
-**Use Case**: Simple, same-account workflows with static credentials
+```
+Pod IRSA Role → source_profile → Target Role (with session_name)
+```
 
-### IAM Role Assumption (Temporary Credentials)
+**Key Features**:
+- **Silent setup**: No debug output, production-ready
+- **Automatic credential refresh**: AWS SDK handles token lifecycle
+- **Session tracking**: Configurable session names for CloudTrail
+- **Cross-account access**: Securely assume roles in different AWS accounts
+- **External ID support**: Enhanced security for cross-account scenarios
 
-When you configure the provider with `assume_role` (no inline credentials):
+### Architecture Details
 
-1. **Ambient Credentials**: The StepAction uses the pod's ambient IRSA credentials (from ServiceAccount)
-2. **Runtime Role Assumption**: When triggered via Facets UI:
-   - The StepAction container has IRSA credentials (not in skip list)
-   - It calls `aws sts assume-role` using the pod's IRSA credentials
-   - Assumes the target role (can be in a different AWS account)
-   - Extracts temporary credentials (access key, secret key, session token) using `jq`
-   - Writes temporary credentials to `~/.aws/credentials` and `~/.aws/config` files
-3. **IRSA Isolation**: User step containers are excluded from IRSA injection via `skip-containers` annotation
-   - User steps do NOT have IRSA environment variables
-   - AWS SDK skips IRSA and uses credential files instead
-   - Commands execute with the assumed role's temporary credentials
-4. **Credential Expiration**: Temporary credentials expire after the configured duration (15 minutes to 12 hours)
-
-**Use Case**: Cross-account access, enhanced security, temporary credentials, audit trails
-
-### Key Architecture Details
-
-- **No Terraform State Exposure**: AWS credentials are NOT stored in Terraform state. Only the Task and StepAction names are tracked.
-- **Credential Location**: Credentials are embedded in the StepAction (visible via `kubectl get stepaction -o yaml` but not in state)
-- **Annotation Propagation**: The `eks.amazonaws.com/skip-containers` annotation is added to Task metadata and automatically propagates through Tekton: Task → TaskRun → Pod
-- **Container Naming**: User steps are named `step-user-step-1`, `step-user-step-2`, etc., and these names are listed in the skip-containers annotation
-- **IRSA Webhook Behavior**: The EKS IRSA webhook reads the skip-containers annotation and:
-  - Injects IRSA credentials into the StepAction container (needed for AssumeRole)
-  - Skips IRSA injection for user step containers (they use credential files)
+- **No Terraform State Exposure**: AWS configuration is NOT stored in Terraform state. Only Task and StepAction names are tracked.
+- **Credential Location**: AWS config is written to `/workspace/.aws/config` at runtime
+- **No skip-containers needed**: All containers receive the same IRSA credentials
+- **Native SDK behavior**: Uses standard AWS SDK credential chain
 
 ## Provider Configuration
 
-Configure the provider with AWS credentials:
-
-### Inline Credentials
-
-```hcl
-provider "facets" {
-  aws = {
-    region     = "us-east-1"
-    access_key = var.aws_access_key  # Sensitive
-    secret_key = var.aws_secret_key  # Sensitive
-  }
-}
-```
-
-### IAM Role Assumption (with Ambient Credentials)
+Configure the provider with AWS assume_role settings:
 
 ```hcl
 provider "facets" {
@@ -76,19 +50,17 @@ provider "facets" {
     region = "us-east-1"
     assume_role = {
       role_arn     = "arn:aws:iam::123456789012:role/TargetRole"
-      session_name = "facets-tekton-session"
+      session_name = "my-workflow"       # Optional (auto-generated if not provided)
       external_id  = "unique-external-id"  # Optional
-      duration     = 3600                   # Optional, 900-43200 seconds
     }
   }
 }
 ```
 
-**Important**: For assume_role, do NOT provide `access_key` or `secret_key`. The StepAction will use the pod's ambient IRSA credentials.
-
-### Priority Logic
-
-If both inline credentials AND assume_role are provided, inline credentials take priority and assume_role is ignored.
+**Requirements**:
+- ServiceAccount must have IRSA role configured
+- IRSA role must have `sts:AssumeRole` permission on the target role
+- Target role must trust the IRSA role (via trust policy)
 
 ## Environment Variables
 
@@ -98,9 +70,19 @@ If both inline credentials AND assume_role are provided, inline credentials take
 
 ## Example Usage
 
-### Basic S3 Sync (Inline Credentials)
+### Basic S3 Operations
 
 ```hcl
+provider "facets" {
+  aws = {
+    region = "us-east-1"
+    assume_role = {
+      role_arn     = "arn:aws:iam::123456789012:role/S3AccessRole"
+      session_name = "s3-sync-workflow"
+    }
+  }
+}
+
 resource "facets_tekton_action_aws" "s3_sync" {
   name                 = "s3-sync"
   description          = "Sync files to S3 bucket"
@@ -112,7 +94,7 @@ resource "facets_tekton_action_aws" "s3_sync" {
 
   facets_resource = {
     kind    = "application"
-    flavor  = "k8s"
+    flavor  = "aws"
     version = "1.0"
     spec    = {}
   }
@@ -136,8 +118,9 @@ resource "facets_tekton_action_aws" "s3_sync" {
       script = <<-EOT
         #!/bin/bash
         set -e
+        # AWS credentials automatically available via IRSA + source_profile
         echo "Syncing files to S3..."
-        aws s3 sync $SOURCE_PATH s3://$BUCKET_NAME/ --delete
+        aws s3 sync $(params.SOURCE_PATH) s3://$(params.BUCKET_NAME)/ --delete
         echo "Sync completed successfully"
       EOT
     }
@@ -145,70 +128,23 @@ resource "facets_tekton_action_aws" "s3_sync" {
 }
 ```
 
-### Cross-Account Access (AssumeRole)
+### Cross-Account Access
 
 ```hcl
 provider "facets" {
   aws = {
-    region = "us-east-1"
+    region = "us-west-2"
     assume_role = {
-      role_arn     = "arn:aws:iam::987654321098:role/CrossAccountS3Role"
-      session_name = "cross-account-s3-sync"
+      role_arn     = "arn:aws:iam::987654321098:role/CrossAccountRole"
+      session_name = "cross-account-operations"
       external_id  = "my-secure-external-id"
-      duration     = 3600
     }
   }
 }
 
-resource "facets_tekton_action_aws" "cross_account_sync" {
-  name                 = "cross-account-s3-sync"
-  description          = "Sync S3 buckets across accounts"
-  facets_resource_name = "my-app"
-
-  facets_environment = {
-    unique_name = "production"
-  }
-
-  facets_resource = {
-    kind    = "application"
-    flavor  = "k8s"
-    version = "1.0"
-    spec    = {}
-  }
-
-  params = [
-    {
-      name = "SOURCE_BUCKET"
-      type = "string"
-    },
-    {
-      name = "DEST_BUCKET"
-      type = "string"
-    }
-  ]
-
-  steps = [
-    {
-      name  = "sync-buckets"
-      image = "amazon/aws-cli:latest"
-
-      script = <<-EOT
-        #!/bin/bash
-        set -e
-        echo "Syncing from source to destination bucket..."
-        aws s3 sync s3://$SOURCE_BUCKET/ s3://$DEST_BUCKET/ --delete
-        echo "Cross-account sync completed"
-      EOT
-    }
-  ]
-}
-```
-
-### Multiple Steps with Environment Variables
-
-```hcl
-resource "facets_tekton_action_aws" "backup_workflow" {
-  name                 = "backup-and-cleanup"
+resource "facets_tekton_action_aws" "cross_account_backup" {
+  name                 = "cross-account-backup"
+  description          = "Backup data to cross-account S3"
   facets_resource_name = "data-service"
 
   facets_environment = {
@@ -217,71 +153,113 @@ resource "facets_tekton_action_aws" "backup_workflow" {
 
   facets_resource = {
     kind    = "service"
-    flavor  = "k8s"
+    flavor  = "aws"
     version = "1.0"
     spec    = {}
   }
 
-  steps = [
+  params = [
     {
-      name  = "backup-database"
-      image = "amazon/aws-cli:latest"
-
-      env = [
-        {
-          name  = "BACKUP_BUCKET"
-          value = "my-backups"
-        }
-      ]
-
-      script = <<-EOT
-        #!/bin/bash
-        set -e
-        BACKUP_FILE="backup-$(date +%Y%m%d-%H%M%S).sql"
-        echo "Creating backup: $BACKUP_FILE"
-        # Backup logic here
-        aws s3 cp "$BACKUP_FILE" "s3://$BACKUP_BUCKET/database/"
-      EOT
+      name = "DATA_FILE"
+      type = "string"
     },
     {
-      name  = "cleanup-old-backups"
-      image = "amazon/aws-cli:latest"
+      name = "BACKUP_BUCKET"
+      type = "string"
+    }
+  ]
 
-      env = [
-        {
-          name  = "BACKUP_BUCKET"
-          value = "my-backups"
-        },
-        {
-          name  = "RETENTION_DAYS"
-          value = "30"
-        }
-      ]
+  steps = [
+    {
+      name  = "backup-data"
+      image = "amazon/aws-cli:latest"
 
       script = <<-EOT
         #!/bin/bash
         set -e
-        echo "Cleaning up backups older than $RETENTION_DAYS days..."
-        CUTOFF_DATE=$(date -d "$RETENTION_DAYS days ago" +%Y-%m-%d)
-        aws s3 ls "s3://$BACKUP_BUCKET/database/" | while read -r line; do
-          FILE_DATE=$(echo $line | awk '{print $1}')
-          if [[ "$FILE_DATE" < "$CUTOFF_DATE" ]]; then
-            FILE_NAME=$(echo $line | awk '{print $4}')
-            aws s3 rm "s3://$BACKUP_BUCKET/database/$FILE_NAME"
-            echo "Deleted: $FILE_NAME"
-          fi
-        done
+
+        # Verify we're using the target account
+        echo "Current identity:"
+        aws sts get-caller-identity
+
+        # Perform backup
+        echo "Backing up data to cross-account bucket..."
+        aws s3 cp $(params.DATA_FILE) s3://$(params.BACKUP_BUCKET)/backups/
+
+        echo "Backup completed successfully"
       EOT
     }
   ]
 }
 ```
 
-### With Resource Limits
+### Multiple Steps with EC2 Operations
 
 ```hcl
-resource "facets_tekton_action_aws" "large_upload" {
-  name                 = "large-file-upload"
+resource "facets_tekton_action_aws" "ec2_workflow" {
+  name                 = "ec2-restart-workflow"
+  description          = "Stop and start EC2 instance"
+  facets_resource_name = "compute-service"
+
+  facets_environment = {
+    unique_name = "staging"
+  }
+
+  facets_resource = {
+    kind    = "service"
+    flavor  = "aws"
+    version = "1.0"
+    spec    = {}
+  }
+
+  params = [
+    {
+      name = "INSTANCE_ID"
+      type = "string"
+    }
+  ]
+
+  steps = [
+    {
+      name  = "stop-instance"
+      image = "amazon/aws-cli:latest"
+
+      script = <<-EOT
+        #!/bin/bash
+        set -e
+        echo "Stopping EC2 instance: $(params.INSTANCE_ID)"
+        aws ec2 stop-instances --instance-ids $(params.INSTANCE_ID)
+
+        # Wait for stopped state
+        aws ec2 wait instance-stopped --instance-ids $(params.INSTANCE_ID)
+        echo "Instance stopped"
+      EOT
+    },
+    {
+      name  = "start-instance"
+      image = "amazon/aws-cli:latest"
+
+      script = <<-EOT
+        #!/bin/bash
+        set -e
+        echo "Starting EC2 instance: $(params.INSTANCE_ID)"
+        aws ec2 start-instances --instance-ids $(params.INSTANCE_ID)
+
+        # Wait for running state
+        aws ec2 wait instance-running --instance-ids $(params.INSTANCE_ID)
+        echo "Instance started successfully"
+      EOT
+    }
+  ]
+}
+```
+
+### With Resource Limits and Environment Variables
+
+```hcl
+resource "facets_tekton_action_aws" "data_processing" {
+  name                 = "process-and-upload"
+  description          = "Process data and upload to S3"
   facets_resource_name = "data-pipeline"
 
   facets_environment = {
@@ -290,20 +268,31 @@ resource "facets_tekton_action_aws" "large_upload" {
 
   facets_resource = {
     kind    = "pipeline"
-    flavor  = "k8s"
+    flavor  = "aws"
     version = "1.0"
     spec    = {}
   }
 
   steps = [
     {
-      name  = "upload-data"
-      image = "amazon/aws-cli:latest"
+      name  = "process-data"
+      image = "python:3.9-slim"
+
+      env = [
+        {
+          name  = "DATA_SOURCE"
+          value = "/workspace/input"
+        },
+        {
+          name  = "PROCESSING_MODE"
+          value = "batch"
+        }
+      ]
 
       resources = {
         requests = {
-          cpu    = "500m"
-          memory = "1Gi"
+          cpu    = "1000m"
+          memory = "2Gi"
         }
         limits = {
           cpu    = "2000m"
@@ -314,8 +303,28 @@ resource "facets_tekton_action_aws" "large_upload" {
       script = <<-EOT
         #!/bin/bash
         set -e
-        echo "Uploading large dataset..."
-        aws s3 cp large-dataset.tar.gz s3://my-bucket/datasets/ --storage-class GLACIER
+        echo "Processing data from $DATA_SOURCE in $PROCESSING_MODE mode..."
+        # Data processing logic here
+        echo "Processing complete"
+      EOT
+    },
+    {
+      name  = "upload-results"
+      image = "amazon/aws-cli:latest"
+
+      env = [
+        {
+          name  = "OUTPUT_BUCKET"
+          value = "my-results-bucket"
+        }
+      ]
+
+      script = <<-EOT
+        #!/bin/bash
+        set -e
+        echo "Uploading results to S3..."
+        aws s3 cp /workspace/output/ s3://$OUTPUT_BUCKET/results/ --recursive
+        echo "Upload complete"
       EOT
     }
   ]
@@ -326,33 +335,33 @@ resource "facets_tekton_action_aws" "large_upload" {
 
 ### Required Arguments
 
-* `name` - (String) Display name of the Tekton Task. This is a human-readable identifier.
-* `facets_resource_name` - (String) Resource name as defined in the Facets blueprint. Used to map the Tekton task back to the blueprint resource in Facets.
-* `facets_environment` - (Object) Facets-managed environment configuration. Required fields:
+* `name` - (String) Display name of the Tekton Task
+* `facets_resource_name` - (String) Resource name as defined in the Facets blueprint
+* `facets_environment` - (Object) Facets-managed environment configuration:
   * `unique_name` - (String) Unique name of the Facets-managed environment
-* `facets_resource` - (Object) Resource definition as specified in the Facets blueprint. Required fields:
-  * `kind` - (String) Resource kind
-  * `flavor` - (String) Resource flavor
+* `facets_resource` - (Object) Resource definition from Facets blueprint:
+  * `kind` - (String) Resource kind (e.g., "application", "service")
+  * `flavor` - (String) Resource flavor (e.g., "aws", "k8s")
   * `version` - (String) Resource version
   * `spec` - (Dynamic) Additional resource specifications (can be empty object)
-* `steps` - (List of Objects) List of workflow steps to execute. Each step requires:
+* `steps` - (List of Objects) List of workflow steps to execute:
   * `name` - (String) Step name
-  * `image` - (String) Container image for the step (should include AWS CLI for AWS operations)
+  * `image` - (String) Container image (should include AWS CLI/SDK for AWS operations)
   * `script` - (String) Script to execute in the step
 
 ### Optional Arguments
 
 * `description` - (String) Description of the Tekton Task
 * `namespace` - (String) Kubernetes namespace for Tekton resources. Defaults to `"tekton-pipelines"`
-* `params` - (List of Objects) List of custom parameters for the Tekton Task. Each parameter has:
+* `params` - (List of Objects) List of custom parameters for the Tekton Task:
   * `name` - (String) Parameter name
   * `type` - (String) Parameter type (e.g., "string", "array")
 
 ### Optional Step Arguments
 
 * `resources` - (Object) Compute resources for the step:
-  * `requests` - (Map of Strings) Minimum compute resources required (e.g., `{cpu = "100m", memory = "128Mi"}`)
-  * `limits` - (Map of Strings) Maximum compute resources allowed (e.g., `{cpu = "500m", memory = "512Mi"}`)
+  * `requests` - (Map of Strings) Minimum compute resources (e.g., `{cpu = "100m", memory = "128Mi"}`)
+  * `limits` - (Map of Strings) Maximum compute resources (e.g., `{cpu = "500m", memory = "512Mi"}`)
 * `env` - (List of Objects) Environment variables for the step:
   * `name` - (String) Environment variable name
   * `value` - (String) Environment variable value
@@ -362,85 +371,92 @@ resource "facets_tekton_action_aws" "large_upload" {
 In addition to all arguments above, the following attributes are exported:
 
 * `id` - Resource identifier in format `namespace/task_name`
-* `task_name` - Generated Tekton Task name (computed from hash of resource_name, environment, and name). This is the actual Kubernetes resource name and may be truncated to 63 characters.
-* `step_action_name` - Generated StepAction name for AWS credential setup (computed from hash). This StepAction automatically configures AWS access for the workflow steps.
+* `task_name` - Generated Tekton Task name (hash-based, may be truncated to 63 characters)
+* `step_action_name` - Generated StepAction name for AWS credential setup
 
-## Auto-Injected Environment Variables
+## AWS Configuration Generated
 
-The following environment variables are automatically injected into all user steps:
+The setup-credentials StepAction creates the following AWS config file at runtime:
 
-* `AWS_CONFIG_FILE` - Path to AWS config file (`/workspace/.aws/config`)
-* `AWS_SHARED_CREDENTIALS_FILE` - Path to AWS credentials file (`/workspace/.aws/credentials`)
+```ini
+[profile irsa]
+web_identity_token_file = /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+role_arn = <POD_IRSA_ROLE_ARN>
 
-These ensure that the AWS CLI and SDK automatically use the credential files created by the StepAction.
+[default]
+source_profile = irsa
+role_arn = <TARGET_ROLE_ARN>
+role_session_name = <SESSION_NAME>
+region = <REGION>
+external_id = <EXTERNAL_ID>  # If provided
+```
 
-## Authentication Methods
+This configuration enables AWS SDK to automatically:
+1. Use IRSA credentials to authenticate as the pod's IAM role
+2. Assume the target role using those credentials
+3. Use the target role's temporary credentials for all AWS operations
 
-### Inline Credentials
+## IAM Requirements
 
-**When to use:**
-- Simple, same-account workflows
-- When you have static AWS credentials
-- Quick setup without IAM role configuration
+### Control Plane IRSA Role
 
-**Security considerations:**
-- Credentials are embedded in StepAction (visible via kubectl)
-- Not stored in Terraform state
-- Long-lived credentials (no automatic expiration)
-- Access controlled by Kubernetes RBAC
+The pod's IRSA role must have permission to assume the target role:
 
-### IAM Role Assumption
-
-**When to use:**
-- Cross-account access required
-- Enhanced security with temporary credentials
-- Audit trails via CloudTrail AssumeRole events
-- When pod already has IRSA configured
-
-**Security considerations:**
-- Uses temporary credentials (expire after duration)
-- No static credentials stored
-- Requires pod to have IRSA with AssumeRole permissions
-- Supports external ID for additional security
-
-**Requirements:**
-- Container image must include AWS CLI v2 and `jq`
-- Pod must have IRSA configured with AssumeRole permissions
-- Target role must trust the pod's IRSA role
-
-**Example IAM trust policy for target role:**
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::111111111111:role/PodIRSARole"
-      },
-      "Action": "sts:AssumeRole",
-      "Condition": {
-        "StringEquals": {
-          "sts:ExternalId": "my-secure-external-id"
-        }
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Resource": "arn:aws:iam::TARGET_ACCOUNT:role/TargetRole"
+  }]
+}
+```
+
+### Target Role Trust Policy
+
+The target role must trust the IRSA role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/IRSARole"
+    },
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {
+        "sts:ExternalId": "my-external-id"  // Optional
       }
     }
-  ]
+  }]
 }
+```
+
+## Session Names
+
+Session names appear in CloudTrail logs and help track who/what assumed the role:
+
+- **Explicit**: Set `session_name` in provider configuration
+- **Auto-generated**: If not provided, generates random name like `terraform-a1b2c3d4e5f6789`
+
+Session names appear in the assumed role ARN:
+```
+arn:aws:sts::123456789012:assumed-role/TargetRole/my-session-name
 ```
 
 ## Comparison with Kubernetes Action
 
-| Aspect | Kubernetes Action | AWS Action (Inline) | AWS Action (AssumeRole) |
-|--------|------------------|---------------------|-------------------------|
-| **Credential Setup** | Decodes kubeconfig parameter | Creates AWS credential files (static) | Assumes role → creates temp credential files |
-| **Credential Source** | Facets UI injects at runtime | Embedded in StepAction | Pod IRSA + AWS STS |
-| **Runtime Parameters** | FACETS_USER_KUBECONFIG | None | None |
-| **Credential Type** | User-specific kubeconfig | Static AWS credentials | Temporary credentials (STS) |
-| **Expiration** | Based on kubeconfig | Never (unless rotated) | After duration (15min-12hr) |
-| **Cross-Account** | N/A | No | Yes |
-| **Container Isolation** | None | Via skip-containers annotation | Via skip-containers annotation |
-| **State Exposure** | No | No | No |
+| Aspect | Kubernetes Action | AWS Action |
+|--------|-------------------|------------|
+| **Credential Setup** | Decodes kubeconfig parameter | Creates AWS config with role chaining |
+| **Credential Source** | Facets UI injects at runtime | Pod IRSA + AWS STS |
+| **Runtime Parameters** | FACETS_USER_KUBECONFIG | None |
+| **Credential Type** | User-specific kubeconfig | Temporary credentials (auto-refreshed) |
+| **Cross-Account** | N/A | Yes |
+| **State Exposure** | No | No |
 
 ## Import
 
@@ -450,7 +466,7 @@ Tekton AWS actions can be imported using the format `namespace/task_name`:
 terraform import facets_tekton_action_aws.example tekton-pipelines/a1b2c3d4e5f6789012345678901234567890abcd
 ```
 
-Note: The task name is a hash-based identifier. You can find it by running:
+To find the task name:
 
 ```shell
 kubectl get tasks -n tekton-pipelines -l display_name=your-action-name
@@ -458,55 +474,55 @@ kubectl get tasks -n tekton-pipelines -l display_name=your-action-name
 
 ## Troubleshooting
 
-### AssumeRole Issues
+### Role Assumption Failures
 
-If AssumeRole fails, check the StepAction logs for detailed output:
+Check the user step logs (setup step is silent):
 
 ```bash
 # Find the TaskRun
 kubectl get taskruns -n tekton-pipelines
 
-# Check logs for the setup-credentials step
-kubectl logs -n tekton-pipelines <taskrun-name> -c step-setup-credentials
+# Check user step logs
+kubectl logs -n tekton-pipelines <taskrun-name> -c step-<step-name>
 ```
 
-The logs include:
-- Full AWS STS AssumeRole response
-- Credential extraction details
-- Any errors from AWS CLI
+Common issues:
+- **AccessDenied**: IRSA role doesn't have `sts:AssumeRole` permission
+- **Not authorized**: Target role's trust policy doesn't allow IRSA role
+- **External ID mismatch**: Check external_id in both provider config and trust policy
 
-### IRSA Not Working
+### IRSA Not Configured
 
-If user steps are using pod IRSA instead of credential files:
+If AWS commands fail with credentials error:
 
-1. Verify skip-containers annotation exists on Task:
+1. Verify ServiceAccount has IRSA annotation:
    ```bash
-   kubectl get task <task-name> -n tekton-pipelines -o jsonpath='{.metadata.annotations}'
+   kubectl get sa <service-account-name> -n <namespace> -o yaml
    ```
+   Should have: `eks.amazonaws.com/role-arn: arn:aws:iam::...`
 
-2. Verify annotation propagated to Pod:
+2. Check pod environment variables:
    ```bash
-   kubectl get pod <pod-name> -o jsonpath='{.metadata.annotations}'
+   kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].env}'
    ```
+   Should include: `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
 
-3. Check that user step container names match annotation:
-   ```bash
-   kubectl get pod <pod-name> -o jsonpath='{.spec.containers[*].name}'
-   ```
+### Debug AWS Configuration
 
-### Credential File Issues
-
-Check that AWS credential files are created correctly:
+Add debug commands to your step script:
 
 ```bash
-# In a user step, add debug commands:
-ls -la /workspace/.aws/
-cat /workspace/.aws/credentials
+# Check AWS config file
 cat /workspace/.aws/config
+
+# Check environment variables
+env | grep AWS
+
+# Test AWS SDK credential chain
+aws sts get-caller-identity
 ```
 
 ## Examples
 
 For complete working examples, see:
-- [Basic S3 Sync (Inline Credentials)](../../examples/aws/basic/)
-- [IAM Role Assumption (Cross-Account)](../../examples/aws/assume-role/)
+- [Cross-Account IAM Role Assumption](../../examples/aws/assume-role/)
