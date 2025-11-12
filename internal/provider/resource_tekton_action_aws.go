@@ -3,10 +3,11 @@ package provider
 import (
 	"context"
 	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
-	"strings"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
@@ -602,7 +603,7 @@ func generateAWSResourceNames(resourceName, envName, displayName string) (string
 	return taskName, stepActionName
 }
 
-// buildAWSStepAction creates the StepAction for AWS credential setup
+// buildAWSStepAction creates the StepAction for AWS credential setup using IRSA
 func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan TektonActionAWSResourceModel, labels map[string]interface{}) (*unstructured.Unstructured, error) {
 	// Convert provider data to aws.ProviderModel for extraction
 	awsProviderModel := &aws.ProviderModel{
@@ -615,15 +616,9 @@ func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan T
 		return nil, fmt.Errorf("failed to get AWS config: %w", err)
 	}
 
-	// Generate appropriate script based on auth type
-	var script string
-	if awsConfig.AssumeRoleConfig != nil {
-		// Use assume role script (always uses ambient credentials - no base credentials needed)
-		script = generateAssumeRoleScript(awsConfig)
-	} else {
-		// Use inline credentials script
-		script = generateInlineCredentialsScript(awsConfig)
-	}
+	// Generate script using IRSA + source_profile for role assumption
+	// AWS SDK automatically handles role chaining from pod's IRSA to target role
+	script := generateAssumeRoleScript(awsConfig)
 
 	stepAction := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -637,8 +632,8 @@ func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan T
 			"spec": map[string]interface{}{
 				"image":  "facetscloud/actions-base-image:v1.0.0",
 				"script": script,
-				// No params needed - credentials are hardcoded in script or use ambient
-				// No env vars needed - everything is in the script
+				// No params needed - AWS SDK uses IRSA from pod automatically
+				// No env vars needed - IRSA injected by EKS webhook
 			},
 		},
 	}
@@ -646,48 +641,9 @@ func (r *TektonActionAWSResource) buildAWSStepAction(ctx context.Context, plan T
 	return stepAction, nil
 }
 
-// generateInlineCredentialsScript creates a script for static AWS credentials
-// This script hardcodes the access key and secret key at StepAction creation time
-func generateInlineCredentialsScript(config *aws.AWSAuthConfig) string {
-	if config.InlineCredentials == nil {
-		return ""
-	}
-
-	return fmt.Sprintf(`#!/bin/bash
-set -e
-
-echo "Setting up AWS credentials (inline)"
-
-# Create AWS config directory
-mkdir -p /workspace/.aws
-
-# Write credentials file (values hardcoded at StepAction creation time)
-cat > /workspace/.aws/credentials <<'EOF'
-[default]
-aws_access_key_id = %s
-aws_secret_access_key = %s
-EOF
-
-# Write config file (region hardcoded at StepAction creation time)
-cat > /workspace/.aws/config <<'EOF'
-[default]
-region = %s
-EOF
-
-# Set permissions
-chmod 600 /workspace/.aws/credentials
-chmod 600 /workspace/.aws/config
-
-echo "AWS credentials configured successfully"
-`,
-		config.InlineCredentials.AccessKey,
-		config.InlineCredentials.SecretKey,
-		config.Region,
-	)
-}
-
-// generateAssumeRoleScript creates a script that assumes an IAM role at runtime
-// Uses ambient/pod credentials (IRSA) to assume the role - no base credentials needed
+// generateAssumeRoleScript creates an AWS config file with source_profile
+// Uses IRSA (pod's IAM role) via source_profile to automatically assume the target role
+// The AWS SDK handles the role assumption automatically - no manual STS calls needed
 func generateAssumeRoleScript(config *aws.AWSAuthConfig) string {
 	if config.AssumeRoleConfig == nil {
 		return ""
@@ -695,66 +651,64 @@ func generateAssumeRoleScript(config *aws.AWSAuthConfig) string {
 
 	assumeRole := config.AssumeRoleConfig
 
-	// Build the aws sts assume-role command with optional parameters
-	assumeRoleCmd := fmt.Sprintf(`aws sts assume-role \
-  --role-arn "%s" \
-  --role-session-name "%s"`,
-		assumeRole.RoleARN,
-		assumeRole.SessionName,
-	)
+	// Generate session name if not provided
+	sessionName := assumeRole.SessionName
+	if sessionName == "" {
+		sessionName = generateRandomSessionName()
+	}
+
+	// Build the config file with source_profile for role chaining
+	// The parent-cp-account profile uses IRSA (web identity token from pod)
+	// The default profile uses source_profile to chain to the target role
+	script := `#!/bin/bash
+set -e
+
+mkdir -p /workspace/.aws
+
+PARENT_ROLE_ARN="${AWS_ROLE_ARN}"
+if [ -z "$PARENT_ROLE_ARN" ]; then
+    echo "ERROR: AWS_ROLE_ARN environment variable not set. IRSA may not be configured." >&2
+    exit 1
+fi
+
+cat > /workspace/.aws/config <<EOFCONFIG
+[profile irsa]
+web_identity_token_file = /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+role_arn = ${PARENT_ROLE_ARN}
+
+[default]
+source_profile = irsa
+role_arn = %s
+role_session_name = %s
+region = %s
+`
 
 	// Add optional external_id if provided
 	if assumeRole.ExternalID != "" {
-		assumeRoleCmd += fmt.Sprintf(` \
-  --external-id "%s"`, assumeRole.ExternalID)
+		script += fmt.Sprintf("external_id = %s\n", assumeRole.ExternalID)
 	}
 
-	// Add duration
-	assumeRoleCmd += fmt.Sprintf(` \
-  --duration-seconds %d \
-  --output json`, assumeRole.Duration)
-
-	// Always use ambient credentials (IRSA) - no base credentials needed
-	return fmt.Sprintf(`#!/bin/bash
-set -e
-
-# Create AWS config directory
-mkdir -p /workspace/.aws
-
-# Create config file (region only, no credentials needed - using ambient auth)
-cat > /workspace/.aws/config <<'EOF'
-[default]
-region = %s
-EOF
+	script += `EOFCONFIG
 
 chmod 600 /workspace/.aws/config
+`
 
-# Assume the role and get temporary credentials
-ASSUME_ROLE_OUTPUT=$(%s)
-
-# Extract temporary credentials using jq
-AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
-AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
-AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
-
-# Validate that credentials were extracted
-if [ -z "$AWS_ACCESS_KEY_ID" ] || [ "$AWS_ACCESS_KEY_ID" == "null" ]; then
-  exit 1
-fi
-
-# Write temporary credentials to file
-cat > /workspace/.aws/credentials <<EOF
-[default]
-aws_access_key_id = $AWS_ACCESS_KEY_ID
-aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
-aws_session_token = $AWS_SESSION_TOKEN
-EOF
-
-chmod 600 /workspace/.aws/credentials
-`,
-		config.Region,
-		assumeRoleCmd,
+	return fmt.Sprintf(script,
+		assumeRole.RoleARN, // For [default] role_arn (target role)
+		sessionName,        // For [default] role_session_name
+		config.Region,      // For [default] region
 	)
+}
+
+// generateRandomSessionName creates a random session name using crypto/rand
+// Returns a string in format "terraform-XXXXXXXX" where X is a random hex character
+func generateRandomSessionName() string {
+	bytes := make([]byte, 8)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback to a simpler approach if crypto/rand fails
+		return fmt.Sprintf("terraform-session-%d", os.Getpid())
+	}
+	return fmt.Sprintf("terraform-%s", hex.EncodeToString(bytes))
 }
 
 // buildAWSTask creates the Tekton Task for AWS workflows
@@ -773,22 +727,15 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		},
 	}
 
-	// Collect user step container names for skip-containers annotation
-	// User steps should NOT receive IRSA injection - they get credentials via files
-	// Tekton prefixes step names with "step-" for container names
-	userStepContainerNames := []string{}
-
 	// Add user-defined steps
 	for _, step := range steps {
-		stepName := step.Name.ValueString()
-		userStepContainerNames = append(userStepContainerNames, "step-"+stepName)
 		tektonStep := map[string]interface{}{
 			"name":   step.Name.ValueString(),
 			"image":  step.Image.ValueString(),
 			"script": step.Script.ValueString(),
 		}
 
-		// Add env vars with AWS file paths
+		// Add env vars - user-provided vars plus AWS config file path
 		var envVars []EnvVarModel
 		if !step.Env.IsNull() {
 			step.Env.ElementsAs(ctx, &envVars, false)
@@ -802,14 +749,11 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 			})
 		}
 
-		// Inject AWS environment variables (file-based credentials)
+		// Inject AWS config file path
+		// AWS SDK will use IRSA + source_profile for authentication
 		envList = append(envList, map[string]interface{}{
 			"name":  "AWS_CONFIG_FILE",
 			"value": "/workspace/.aws/config",
-		})
-		envList = append(envList, map[string]interface{}{
-			"name":  "AWS_SHARED_CREDENTIALS_FILE",
-			"value": "/workspace/.aws/credentials",
 		})
 		tektonStep["env"] = envList
 
@@ -874,16 +818,6 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		"name":      plan.TaskName.ValueString(),
 		"namespace": plan.Namespace.ValueString(),
 		"labels":    labels,
-	}
-
-	// Add skip-containers annotation to Task metadata
-	// Annotations propagate from Task → TaskRun → Pod in Tekton
-	// User steps receive credentials via files, not IRSA, so exclude them from IRSA injection
-	if len(userStepContainerNames) > 0 {
-		skipContainers := strings.Join(userStepContainerNames, ",")
-		metadata["annotations"] = map[string]string{
-			"eks.amazonaws.com/skip-containers": skipContainers,
-		}
 	}
 
 	// Build task object using unstructured (idiomatic for dynamic K8s resources)

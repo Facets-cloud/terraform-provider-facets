@@ -8,20 +8,20 @@ terraform {
 }
 
 # Configure the Facets provider with AWS assume_role
-# This example demonstrates using IAM role assumption with ambient/pod credentials
-# The pod must have IAM permissions (via IRSA, instance profile, etc.) to assume the role
+# This example demonstrates using IAM role assumption with IRSA (IAM Roles for Service Accounts)
+# The pod's service account must be configured with IAM role annotation
+# At runtime, AWS SDK uses pod's IRSA credentials to assume the target role
 provider "facets" {
   aws = {
     region = var.aws_region
 
-    # Assume an IAM role to get temporary credentials
-    # The pod's ambient credentials (IRSA, instance profile, etc.) will be used
-    # to assume this role at Task runtime
+    # Assume an IAM role using IRSA
+    # The pod's IRSA role must have permission to assume this target role
+    # AWS SDK automatically handles role chaining via source_profile
     assume_role = {
-      role_arn     = var.role_arn
+      role_arn    = var.role_arn
+      external_id = var.external_id # Optional: required if role trust policy specifies it
       session_name = var.session_name
-      external_id  = var.external_id  # Optional: required if role trust policy specifies it
-      duration     = 3600             # Optional: 1 hour (default), max 12 hours
     }
   }
 }

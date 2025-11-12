@@ -129,19 +129,19 @@ func containsString(slice []string, str string) bool {
 	return false
 }
 
-// Test script generation for inline credentials
-func TestGenerateInlineCredentialsScript(t *testing.T) {
+// Test script generation for IRSA with source_profile
+func TestGenerateAssumeRoleScriptWithSourceProfile(t *testing.T) {
 	config := &aws.AWSAuthConfig{
 		Region: "us-west-2",
-		InlineCredentials: &aws.InlineCredentials{
-			AccessKey: "AKIAIOSFODNN7EXAMPLE",
-			SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		AssumeRoleConfig: &aws.AssumeRoleConfig{
+			RoleARN:    "arn:aws:iam::123456789012:role/target-role",
+			ExternalID: "my-external-id",
 		},
 	}
 
-	script := generateInlineCredentialsScript(config)
+	script := generateAssumeRoleScript(config)
 
-	// Validate script contains expected elements
+	// Validate script contains expected elements for source_profile approach
 	if !strings.Contains(script, "#!/bin/bash") {
 		t.Error("Script missing shebang")
 	}
@@ -151,68 +151,52 @@ func TestGenerateInlineCredentialsScript(t *testing.T) {
 	if !strings.Contains(script, "mkdir -p /workspace/.aws") {
 		t.Error("Script missing directory creation")
 	}
-	if !strings.Contains(script, "AKIAIOSFODNN7EXAMPLE") {
-		t.Error("Script missing access key")
+	if !strings.Contains(script, "PARENT_ROLE_ARN=\"${AWS_ROLE_ARN}\"") {
+		t.Error("Script missing PARENT_ROLE_ARN environment variable extraction")
 	}
-	if !strings.Contains(script, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") {
-		t.Error("Script missing secret key")
+	if !strings.Contains(script, "[profile irsa]") {
+		t.Error("Script missing IRSA profile")
+	}
+	if !strings.Contains(script, "web_identity_token_file = /var/run/secrets/eks.amazonaws.com/serviceaccount/token") {
+		t.Error("Script missing IRSA token file path")
+	}
+	if !strings.Contains(script, "role_arn = ${PARENT_ROLE_ARN}") {
+		t.Error("Script missing parent role ARN variable in IRSA profile")
+	}
+	if !strings.Contains(script, "[default]") {
+		t.Error("Script missing default profile")
+	}
+	if !strings.Contains(script, "source_profile = irsa") {
+		t.Error("Script missing source_profile for role chaining")
+	}
+	if !strings.Contains(script, "role_arn = arn:aws:iam::123456789012:role/target-role") {
+		t.Error("Script missing target role ARN")
 	}
 	if !strings.Contains(script, "region = us-west-2") {
 		t.Error("Script missing region")
 	}
-	if !strings.Contains(script, "chmod 600") {
-		t.Error("Script missing permissions setting")
-	}
-	// Note: AWS env vars are injected in buildAWSTask, not in the script
-}
-
-// Test script generation for assume role
-func TestGenerateAssumeRoleScript(t *testing.T) {
-	config := &aws.AWSAuthConfig{
-		Region: "us-east-1",
-		AssumeRoleConfig: &aws.AssumeRoleConfig{
-			RoleARN:         "arn:aws:iam::123456789012:role/my-role",
-			SessionName:     "test-session",
-			ExternalID:      "my-external-id",
-			Duration:        3600,
-			BaseCredentials: nil, // Always uses ambient/IRSA credentials now
-		},
-	}
-
-	script := generateAssumeRoleScript(config)
-
-	// Validate script contains expected elements
-	if !strings.Contains(script, "#!/bin/bash") {
-		t.Error("Script missing shebang")
-	}
-	if !strings.Contains(script, "set -e") {
-		t.Error("Script missing error handling")
-	}
-	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
-		t.Error("Script missing role ARN")
-	}
-	if !strings.Contains(script, "--role-session-name \"test-session\"") {
-		t.Error("Script missing session name")
-	}
-	if !strings.Contains(script, "--external-id \"my-external-id\"") {
+	if !strings.Contains(script, "external_id = my-external-id") {
 		t.Error("Script missing external ID")
 	}
-	if !strings.Contains(script, "--duration-seconds 3600") {
-		t.Error("Script missing duration")
-	}
-	if !strings.Contains(script, "aws sts assume-role") {
-		t.Error("Script missing AWS STS assume-role command")
-	}
-	if !strings.Contains(script, "jq -r '.Credentials.AccessKeyId'") {
-		t.Error("Script missing credential extraction with jq")
-	}
-	if !strings.Contains(script, "aws_session_token") {
-		t.Error("Script missing session token")
+	if !strings.Contains(script, "role_session_name = ") {
+		t.Error("Script missing role_session_name")
 	}
 	if !strings.Contains(script, "chmod 600") {
 		t.Error("Script missing permissions setting")
 	}
-	// Note: Always uses ambient credentials (IRSA), not base credentials
+	// Should NOT contain manual AWS STS assume-role call, jq, or debug output
+	if strings.Contains(script, "aws sts assume-role") {
+		t.Error("Script should not contain manual STS assume-role (AWS SDK handles it)")
+	}
+	if strings.Contains(script, "aws sts get-caller-identity") {
+		t.Error("Script should not contain test commands")
+	}
+	if strings.Contains(script, "jq") {
+		t.Error("Script should not use jq (AWS SDK handles credential extraction)")
+	}
+	if strings.Contains(script, "cat /workspace/.aws/config") {
+		t.Error("Script should not contain debug output")
+	}
 }
 
 // Test assume role script without external ID
@@ -220,83 +204,55 @@ func TestGenerateAssumeRoleScriptWithoutExternalID(t *testing.T) {
 	config := &aws.AWSAuthConfig{
 		Region: "us-east-1",
 		AssumeRoleConfig: &aws.AssumeRoleConfig{
-			RoleARN:     "arn:aws:iam::123456789012:role/my-role",
-			SessionName: "test-session",
-			ExternalID:  "", // No external ID
-			Duration:    7200,
-			BaseCredentials: &aws.InlineCredentials{
-				AccessKey: "AKIAIOSFODNN7EXAMPLE",
-				SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-			},
+			RoleARN:    "arn:aws:iam::123456789012:role/my-role",
+			ExternalID: "", // No external ID
 		},
 	}
 
 	script := generateAssumeRoleScript(config)
-
-	// Validate external_id is NOT in the command when empty
-	if strings.Contains(script, "--external-id \"\"") {
-		t.Error("Script should not include empty external-id flag")
-	}
-
-	// But should still contain other elements
-	if !strings.Contains(script, "aws sts assume-role") {
-		t.Error("Script missing AWS STS assume-role command")
-	}
-	if !strings.Contains(script, "--duration-seconds 7200") {
-		t.Error("Script has wrong duration")
-	}
-}
-
-// Test assume role script with ambient/pod credentials (no base credentials)
-func TestGenerateAssumeRoleScriptWithAmbientCredentials(t *testing.T) {
-	config := &aws.AWSAuthConfig{
-		Region: "us-east-1",
-		AssumeRoleConfig: &aws.AssumeRoleConfig{
-			RoleARN:         "arn:aws:iam::123456789012:role/my-role",
-			SessionName:     "test-session",
-			ExternalID:      "external-123",
-			Duration:        3600,
-			BaseCredentials: nil, // No base credentials - using ambient/pod credentials
-		},
-	}
-
-	script := generateAssumeRoleScript(config)
-
-	// Should NOT hardcode static credentials (only temp creds from STS response)
-	if strings.Contains(script, "aws_access_key_id = AKIA") && !strings.Contains(script, "$AWS_ACCESS_KEY_ID") {
-		t.Error("Script should not hardcode static credentials when using ambient auth")
-	}
-
-	// Should still call assume-role
-	if !strings.Contains(script, "aws sts assume-role") {
-		t.Error("Script missing AWS STS assume-role command")
-	}
 
 	// Should have role ARN
 	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
 		t.Error("Script missing role ARN")
 	}
 
-	// Should have external ID
-	if !strings.Contains(script, "--external-id \"external-123\"") {
-		t.Error("Script missing external ID")
-	}
-
-	// Should create config file with region only
+	// Should have region
 	if !strings.Contains(script, "region = us-east-1") {
-		t.Error("Script missing region in config")
+		t.Error("Script missing region")
 	}
 
-	// Note: AWS env vars are injected in buildAWSTask, not in the script
+	// Should have source_profile
+	if !strings.Contains(script, "source_profile = irsa") {
+		t.Error("Script missing source_profile")
+	}
+
+	// Validate external_id is NOT in the config when empty
+	if strings.Contains(script, "external_id =") {
+		t.Error("Script should not include external_id field when it's empty")
+	}
 }
 
-// Test script generation returns empty for nil configs
-func TestGenerateScriptWithNilConfig(t *testing.T) {
-	inlineScript := generateInlineCredentialsScript(&aws.AWSAuthConfig{})
-	if inlineScript != "" {
-		t.Error("Expected empty script for nil InlineCredentials")
+// Test script with explicit session name
+func TestGenerateAssumeRoleScriptWithSessionName(t *testing.T) {
+	config := &aws.AWSAuthConfig{
+		Region: "us-east-1",
+		AssumeRoleConfig: &aws.AssumeRoleConfig{
+			RoleARN:     "arn:aws:iam::123456789012:role/my-role",
+			ExternalID:  "test-external-id",
+			SessionName: "my-custom-session",
+		},
 	}
 
+	script := generateAssumeRoleScript(config)
+
+	// Should have the explicit session name
+	if !strings.Contains(script, "role_session_name = my-custom-session") {
+		t.Error("Script missing explicit session name")
+	}
+}
+
+// Test script generation returns empty for nil AssumeRoleConfig
+func TestGenerateScriptWithNilConfig(t *testing.T) {
 	assumeRoleScript := generateAssumeRoleScript(&aws.AWSAuthConfig{})
 	if assumeRoleScript != "" {
 		t.Error("Expected empty script for nil AssumeRoleConfig")
