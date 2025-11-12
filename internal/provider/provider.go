@@ -22,16 +22,13 @@ type FacetsProviderModel struct {
 
 type ProviderAWSConfig struct {
 	Region     types.String `tfsdk:"region"`
-	AccessKey  types.String `tfsdk:"access_key"`
-	SecretKey  types.String `tfsdk:"secret_key"`
 	AssumeRole types.Object `tfsdk:"assume_role"`
 }
 
 type ProviderAWSAssumeRoleConfig struct {
 	RoleARN     types.String `tfsdk:"role_arn"`
-	SessionName types.String `tfsdk:"session_name"`
 	ExternalID  types.String `tfsdk:"external_id"`
-	Duration    types.Int64  `tfsdk:"duration"`
+	SessionName types.String `tfsdk:"session_name"`
 }
 
 func (p *FacetsProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -46,49 +43,36 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 			"aws": schema.SingleNestedAttribute{
 				Description: "AWS configuration for facets_tekton_action_aws resources. " +
 					"This block is optional and only required when using AWS actions. " +
-					"If only using Kubernetes actions, this can be omitted. " +
-					"Supports either inline credentials (access_key + secret_key) or assume_role configuration with ambient credentials.",
+					"Uses IRSA (IAM Roles for Service Accounts) for authentication - the pod's service account " +
+					"must be configured with IAM role annotation. The AWS CLI will use the pod's IRSA credentials " +
+					"to assume the target role specified in assume_role configuration.",
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
 					"region": schema.StringAttribute{
 						Description: "AWS region (e.g., us-west-2)",
-						Optional:    true,
-					},
-					"access_key": schema.StringAttribute{
-						Description: "AWS Access Key ID. Optional - only required for inline authentication. " +
-							"When using assume_role with ambient/pod credentials (IRSA, instance profile), this can be omitted.",
-						Optional:  true,
-						Sensitive: true,
-					},
-					"secret_key": schema.StringAttribute{
-						Description: "AWS Secret Access Key. Optional - only required for inline authentication. " +
-							"When using assume_role with ambient/pod credentials (IRSA, instance profile), this can be omitted.",
-						Optional:  true,
-						Sensitive: true,
+						Required:    true,
 					},
 					"assume_role": schema.SingleNestedAttribute{
-						Description: "Configuration for assuming an IAM role. When specified, the provider will use AWS STS " +
-							"AssumeRole to obtain temporary credentials at Task runtime. If access_key and secret_key are omitted, " +
-							"the provider will use ambient credentials (IRSA, instance profile, etc.) to assume the role.",
-						Optional: true,
+						Description: "Configuration for assuming an IAM role using IRSA. The pod's service account " +
+							"must have permissions to assume the specified role. At runtime, the AWS SDK will use " +
+							"the pod's IRSA credentials to assume this role via AWS STS AssumeRole.",
+						Required: true,
 						Attributes: map[string]schema.Attribute{
 							"role_arn": schema.StringAttribute{
-								Description: "ARN of the IAM role to assume (e.g., arn:aws:iam::123456789012:role/my-role)",
-								Required:    true,
-							},
-							"session_name": schema.StringAttribute{
-								Description: "Session name for the assumed role session. Used for CloudTrail auditing. " +
-									"If not specified, defaults to 'terraform-provider-session'.",
-								Optional: true,
+								Description: "ARN of the IAM role to assume (e.g., arn:aws:iam::123456789012:role/my-role). " +
+									"This role's trust policy must allow the pod's IRSA role to assume it.",
+								Required: true,
 							},
 							"external_id": schema.StringAttribute{
 								Description: "External ID for assuming the role. Required when the role's trust policy " +
-									"specifies an external ID condition.",
+									"specifies an external ID condition. This provides additional security against " +
+									"the confused deputy problem.",
 								Optional: true,
 							},
-							"duration": schema.Int64Attribute{
-								Description: "Duration of the assumed role session in seconds. " +
-									"Must be between 900 (15 minutes) and 43200 (12 hours). Defaults to 3600 (1 hour).",
+							"session_name": schema.StringAttribute{
+								Description: "Session name to use when assuming the role. If not provided, a random " +
+									"session name will be generated. This appears in CloudTrail logs and can be used " +
+									"for tracking and auditing purposes.",
 								Optional: true,
 							},
 						},

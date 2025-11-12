@@ -1,25 +1,23 @@
 variable "aws_region" {
   description = "AWS region"
   type        = string
-  default     = "us-east-1"
+  default     = "ap-south-1"
 }
 
 variable "role_arn" {
-  description = "ARN of the IAM role to assume. The pod must have permissions to assume this role."
+  description = "ARN of the IAM role to assume. The pod's IRSA role must have permissions to assume this role."
   type        = string
-  # Example: "arn:aws:iam::123456789012:role/my-cross-account-role"
-}
-
-variable "session_name" {
-  description = "Session name for the assumed role session (used for CloudTrail auditing)"
-  type        = string
-  default     = "terraform-facets-session"
 }
 
 variable "external_id" {
-  description = "External ID for assuming the role (optional, required if role trust policy specifies it)"
+  description = "External ID for assuming the role (optional, required if role trust policy specifies it). Provides additional security against the confused deputy problem."
   type        = string
-  default     = ""
+}
+
+variable "session_name" {
+  description = "Session name for the assumed role."
+  type        = string
+  default     = "terraform-session"
 }
 
 variable "resource_name" {
