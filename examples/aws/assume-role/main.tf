@@ -35,15 +35,9 @@ resource "facets_tekton_action_aws" "integration_test" {
     unique_name = "integration-test-env"
   }
 
-  # Facets resource object (all fields)
+  # Facets resource object
   facets_resource = {
-    kind    = "application"
-    flavor  = "aws"
-    version = "1.0.0"
-    spec = {
-      tier = "backend"
-      team = "platform"
-    }
+    kind = "application"
   }
 
   # Optional namespace
