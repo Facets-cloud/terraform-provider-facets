@@ -320,13 +320,15 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		clusterID = "na"
 	}
 
-	// Create labels
+	// Create labels (no custom labels for AWS actions currently)
 	labels := buildLabels(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		true, // cloud_action: true for AWS actions
+		nil,  // customLabels: not supported for AWS actions yet
 	)
 
 	// Create StepAction
@@ -424,13 +426,15 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		clusterID = "na"
 	}
 
-	// Create labels
+	// Create labels (no custom labels for AWS actions currently)
 	labels := buildLabels(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		true, // cloud_action: true for AWS actions
+		nil,  // customLabels: not supported for AWS actions yet
 	)
 
 	// Update StepAction

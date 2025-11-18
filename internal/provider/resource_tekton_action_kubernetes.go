@@ -336,6 +336,7 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		false, // cloud_action: false for Kubernetes actions
 		customLabels,
 	)
 
@@ -443,6 +444,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		false, // cloud_action: false for Kubernetes actions
 		customLabels,
 	)
 
@@ -600,7 +602,7 @@ func generateResourceNames(resourceName, envName, displayName string) (string, s
 
 // buildLabels creates the standard label map for Tekton resources
 // Custom labels are merged with auto-generated labels, with auto-generated taking precedence
-func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string, customLabels map[string]string) map[string]interface{} {
+func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string, cloudAction bool, customLabels map[string]string) map[string]interface{} {
 	labels := make(map[string]interface{})
 
 	// First, add custom labels (if any)
@@ -614,6 +616,7 @@ func buildLabels(displayName, resourceName, resourceKind, envUniqueName, cluster
 	labels["resource_kind"] = resourceKind
 	labels["environment_unique_name"] = envUniqueName
 	labels["cluster_id"] = clusterID
+	labels["cloud_action"] = cloudAction
 
 	return labels
 }
