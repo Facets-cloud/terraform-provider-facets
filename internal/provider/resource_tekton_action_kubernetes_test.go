@@ -78,43 +78,48 @@ func TestBuildLabels(t *testing.T) {
 		resourceKind      string
 		envUniqueName     string
 		clusterID         string
+		cloudAction       bool
 		expectedLabelKeys []string
 	}{
 		{
-			name:          "all fields present",
+			name:          "all fields present - kubernetes action",
 			displayName:   "my-action",
 			resourceName:  "my-app",
 			resourceKind:  "application",
 			envUniqueName: "production",
 			clusterID:     "cluster-01",
+			cloudAction:   false,
 			expectedLabelKeys: []string{
 				"display_name",
 				"resource_name",
 				"resource_kind",
 				"environment_unique_name",
 				"cluster_id",
+				"cloud_action",
 			},
 		},
 		{
-			name:          "default cluster_id",
+			name:          "default cluster_id - aws action",
 			displayName:   "test",
 			resourceName:  "app",
 			resourceKind:  "service",
 			envUniqueName: "dev",
 			clusterID:     "na",
+			cloudAction:   true,
 			expectedLabelKeys: []string{
 				"display_name",
 				"resource_name",
 				"resource_kind",
 				"environment_unique_name",
 				"cluster_id",
+				"cloud_action",
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			labels := buildLabels(tt.displayName, tt.resourceName, tt.resourceKind, tt.envUniqueName, tt.clusterID)
+			labels := buildLabels(tt.displayName, tt.resourceName, tt.resourceKind, tt.envUniqueName, tt.clusterID, tt.cloudAction)
 
 			// Check all expected keys are present
 			for _, key := range tt.expectedLabelKeys {
@@ -138,6 +143,9 @@ func TestBuildLabels(t *testing.T) {
 			}
 			if labels["cluster_id"] != tt.clusterID {
 				t.Errorf("cluster_id = %s, want %s", labels["cluster_id"], tt.clusterID)
+			}
+			if labels["cloud_action"] != tt.cloudAction {
+				t.Errorf("cloud_action = %v, want %v", labels["cloud_action"], tt.cloudAction)
 			}
 		})
 	}

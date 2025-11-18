@@ -327,6 +327,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		true, // cloud_action: true for AWS actions
 	)
 
 	// Create StepAction
@@ -431,6 +432,7 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		true, // cloud_action: true for AWS actions
 	)
 
 	// Update StepAction
