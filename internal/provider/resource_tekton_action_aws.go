@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 
+	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -20,21 +21,26 @@ import (
 )
 
 var (
-	_ resource.Resource                = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithConfigure   = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithImportState = &TektonActionKubernetesResource{}
+	_ resource.Resource                = &TektonActionAWSResource{}
+	_ resource.ResourceWithConfigure   = &TektonActionAWSResource{}
+	_ resource.ResourceWithImportState = &TektonActionAWSResource{}
 )
 
-func NewTektonActionKubernetesResource() resource.Resource {
-	return &TektonActionKubernetesResource{}
+// NewTektonActionAWSResource creates a new AWS action resource
+func NewTektonActionAWSResource() resource.Resource {
+	return &TektonActionAWSResource{}
 }
 
-type TektonActionKubernetesResource struct {
-	client     dynamic.Interface
-	operations *tekton.ResourceOperations
+// TektonActionAWSResource manages Tekton Tasks and StepActions for AWS workflows
+type TektonActionAWSResource struct {
+	client       dynamic.Interface
+	providerData *FacetsProviderModel
+	operations   *tekton.ResourceOperations
 }
 
-type TektonActionKubernetesResourceModel struct {
+// TektonActionAWSResourceModel represents the resource data model
+// This is identical to the Kubernetes action model since the schema is the same
+type TektonActionAWSResourceModel struct {
 	ID                 types.String `tfsdk:"id"`
 	Name               types.String `tfsdk:"name"`
 	Description        types.String `tfsdk:"description"`
@@ -48,16 +54,16 @@ type TektonActionKubernetesResourceModel struct {
 	StepActionName     types.String `tfsdk:"step_action_name"`
 }
 
-func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_tekton_action_kubernetes"
+func (r *TektonActionAWSResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_tekton_action_aws"
 }
 
-func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *TektonActionAWSResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages a Tekton Task and StepAction for Kubernetes-based workflows. " +
-			"This resource automatically injects Kubernetes credentials (FACETS_USER_KUBECONFIG) " +
-			"via a setup-credentials step, which is populated by the Facets UI when users run actions. " +
-			"The kubeconfig is scoped to the user's RBAC permissions.",
+		Description: "Manages a Tekton Task and StepAction for AWS-based workflows. " +
+			"This resource automatically injects AWS credentials (configured at provider level) " +
+			"via a setup-credentials step, which creates ~/.aws/credentials and ~/.aws/config files. " +
+			"The credentials are scoped to the AWS account configured in the provider.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Resource identifier",
@@ -215,16 +221,18 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 				Computed: true,
 			},
 			"step_action_name": schema.StringAttribute{
-				Description: "Generated StepAction name for credential setup (computed from hash). " +
-					"This StepAction automatically configures Kubernetes access for the workflow steps.",
+				Description: "Generated StepAction name for AWS credential setup (computed from hash). " +
+					"This StepAction automatically configures AWS access for the workflow steps.",
 				Computed: true,
 			},
 		},
 	}
 }
 
-func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
-	// Always create Kubernetes client
+func (r *TektonActionAWSResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	// Create Kubernetes client
+	// Note: We need the Kubernetes client because we're creating Tekton CRDs (Tasks, StepActions)
+	// in the control plane cluster. The AWS credentials are only used at Tekton runtime.
 	client, err := k8s.GetKubernetesClient()
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -236,10 +244,40 @@ func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req reso
 
 	r.client = client
 	r.operations = tekton.NewResourceOperations(client)
+
+	// Store provider data for accessing AWS config during Create/Update
+	if req.ProviderData != nil {
+		// Type assert to get provider model
+		providerModel, ok := req.ProviderData.(*FacetsProviderModel)
+		if !ok {
+			resp.Diagnostics.AddError(
+				"Unexpected Provider Data Type",
+				fmt.Sprintf("Expected *FacetsProviderModel, got: %T", req.ProviderData),
+			)
+			return
+		}
+
+		// Convert to aws.ProviderModel for validation
+		// This avoids import cycles while maintaining type safety
+		awsProviderModel := &aws.ProviderModel{
+			AWS: providerModel.AWS,
+		}
+
+		// Validate AWS configuration is present
+		_, err := aws.GetAWSConfig(ctx, awsProviderModel)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"AWS Configuration Error",
+				err.Error(),
+			)
+			return
+		}
+		r.providerData = providerModel
+	}
 }
 
-func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var plan TektonActionKubernetesResourceModel
+func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan TektonActionAWSResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -281,15 +319,36 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		false, // cloud_action: false for Kubernetes actions
+		true, // cloud_action: true for AWS actions
 	)
 
+	// Get AWS config
+	awsProviderModel := &aws.ProviderModel{
+		AWS: r.providerData.AWS,
+	}
+	awsConfig, err := aws.GetAWSConfig(ctx, awsProviderModel)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"AWS Configuration Error",
+			err.Error(),
+		)
+		return
+	}
+
 	// Create StepAction
-	stepAction := tekton.BuildKubernetesStepAction(
+	stepAction, err := tekton.BuildAWSStepAction(
 		plan.StepActionName.ValueString(),
 		plan.Namespace.ValueString(),
 		metadata.LabelsAsInterface(),
+		awsConfig,
 	)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error building StepAction",
+			fmt.Sprintf("Could not build StepAction: %s", err.Error()),
+		)
+		return
+	}
 	if err := r.operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error creating StepAction",
@@ -299,7 +358,7 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Create Task
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -315,8 +374,8 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var state TektonActionAWSResourceModel
 
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -339,9 +398,9 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan TektonActionKubernetesResourceModel
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan TektonActionAWSResourceModel
+	var state TektonActionAWSResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -376,15 +435,36 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		false, // cloud_action: false for Kubernetes actions
+		true, // cloud_action: true for AWS actions
 	)
 
+	// Get AWS config
+	awsProviderModel := &aws.ProviderModel{
+		AWS: r.providerData.AWS,
+	}
+	awsConfig, err := aws.GetAWSConfig(ctx, awsProviderModel)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"AWS Configuration Error",
+			err.Error(),
+		)
+		return
+	}
+
 	// Update StepAction
-	stepAction := tekton.BuildKubernetesStepAction(
+	stepAction, err := tekton.BuildAWSStepAction(
 		plan.StepActionName.ValueString(),
 		plan.Namespace.ValueString(),
 		metadata.LabelsAsInterface(),
+		awsConfig,
 	)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error building StepAction",
+			fmt.Sprintf("Could not build StepAction: %s", err.Error()),
+		)
+		return
+	}
 	if err := r.operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating StepAction",
@@ -394,7 +474,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	}
 
 	// Update Task
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
 	if err := r.operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating Task",
@@ -406,8 +486,8 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var state TektonActionAWSResourceModel
 
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -433,7 +513,7 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 	}
 }
 
-func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Import format: namespace/taskName
 	// Example: tekton-pipelines/59f6f855860ddc99a32e2944c96db5fa
 
@@ -492,7 +572,7 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	stepActionName := fmt.Sprintf("setup-credentials-%s", taskName)
 
 	// Set state with imported values
-	state := TektonActionKubernetesResourceModel{
+	state := TektonActionAWSResourceModel{
 		ID:                 types.StringValue(fmt.Sprintf("%s/%s", namespace, taskName)),
 		Name:               types.StringValue(displayName),
 		FacetsResourceName: types.StringValue(resourceName),
@@ -511,46 +591,32 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// buildTask creates the Tekton Task for Kubernetes workflows
-func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
+// buildAWSTask creates the Tekton Task for AWS workflows
+func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonActionAWSResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
+	// First step: setup-credentials (references StepAction, no params needed)
 	tektonSteps := []interface{}{
 		map[string]interface{}{
 			"name": "setup-credentials",
 			"ref": map[string]interface{}{
 				"name": plan.StepActionName.ValueString(),
 			},
-			"params": []interface{}{
-				map[string]interface{}{
-					"name":  "FACETS_USER_KUBECONFIG",
-					"value": "$(params.FACETS_USER_KUBECONFIG)",
-				},
-			},
 		},
 	}
 
+	// Add user-defined steps with AWS_CONFIG_FILE env var
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
-		tekton.AddEnvVar(tektonStep, "KUBECONFIG", "/workspace/.kube/config")
+		// Inject AWS config file path - AWS SDK will use IRSA + source_profile for authentication
+		tekton.AddEnvVar(tektonStep, "AWS_CONFIG_FILE", "/workspace/.aws/config")
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
-	// Build params
-	taskParams := []interface{}{
-		map[string]interface{}{
-			"name": "FACETS_USER_EMAIL",
-			"type": "string",
-		},
-		map[string]interface{}{
-			"name": "FACETS_USER_KUBECONFIG",
-			"type": "string",
-		},
-	}
-
-	// Add user-defined params
+	// Build params (only user-defined params, no AWS params needed)
+	taskParams := []interface{}{}
 	if !plan.Params.IsNull() {
 		var params []tekton.ParamModel
 		plan.Params.ElementsAs(ctx, &params, false)
@@ -562,10 +628,15 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		}
 	}
 
+	description := plan.TaskName.ValueString()
+	if !plan.Description.IsNull() && plan.Description.ValueString() != "" {
+		description = plan.Description.ValueString()
+	}
+
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
 		Namespace:   plan.Namespace.ValueString(),
-		Description: plan.Description.ValueString(),
+		Description: description,
 		Labels:      labels,
 	}, tektonSteps, taskParams)
 }

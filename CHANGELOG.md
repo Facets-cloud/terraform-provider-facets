@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.4] - 2024-01-XX
 
 ### Fixed
-- Corrected `facets_resource` schema for `facets_tekton_action_kubernetes` resource
+- Corrected `facets_resource` schema for `facets_tekton_action_kubernetes` and `facets_tekton_action_aws` resources
   - Removed unused `flavor`, `version`, and `spec` fields from schema
   - Only `kind` field is tracked in state (used in resource labels)
   - Other fields can still be provided in configuration but are silently ignored
