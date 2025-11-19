@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
+	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 )
 
 func TestGenerateAWSResourceNames(t *testing.T) {
@@ -20,20 +21,22 @@ func TestGenerateAWSResourceNames(t *testing.T) {
 			resourceName: "my-app",
 			envName:      "prod",
 			displayName:  "restart",
-			wantPrefix:   "setup-aws-credentials-",
+			wantPrefix:   "setup-credentials-",
 		},
 		{
 			name:         "long names",
 			resourceName: "my-very-long-application-name-that-should-be-hashed",
 			envName:      "production-environment",
 			displayName:  "very-long-display-name-for-testing",
-			wantPrefix:   "setup-aws-credentials-",
+			wantPrefix:   "setup-credentials-",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			taskName, stepActionName := generateAWSResourceNames(tt.resourceName, tt.envName, tt.displayName)
+			names := tekton.GenerateNames(tt.resourceName, tt.envName, tt.displayName)
+			taskName := names.TaskName
+			stepActionName := names.StepActionName
 
 			// Task name should be a hash
 			if len(taskName) == 0 {
@@ -56,14 +59,14 @@ func TestGenerateAWSResourceNames(t *testing.T) {
 				t.Errorf("stepActionName too short to contain prefix")
 			}
 
-			// StepAction name should be setup-aws-credentials-{hash}
+			// StepAction name should be setup-credentials-{hash}
 			// After truncation to 63 chars, it might not have full prefix
-			// But it should contain "aws-credentials-" at minimum
+			// But it should contain "credentials-" at minimum
 			if len(stepActionName) == 63 {
 				// Truncated - check it contains expected substring
-				if stepActionName[0:len("aws-credentials-")] != "aws-credentials-" &&
-					stepActionName[0:len("setup-aws-cred")] != "setup-aws-cred" {
-					t.Errorf("stepActionName doesn't contain expected AWS prefix pattern: %s", stepActionName)
+				if stepActionName[0:len("credentials-")] != "credentials-" &&
+					stepActionName[0:len("setup-credent")] != "setup-credent" {
+					t.Errorf("stepActionName doesn't contain expected prefix pattern: %s", stepActionName)
 				}
 			} else {
 				// Not truncated - should have full prefix
@@ -139,7 +142,7 @@ func TestGenerateAssumeRoleScriptWithSourceProfile(t *testing.T) {
 		},
 	}
 
-	script := generateAssumeRoleScript(config)
+	script := tekton.GenerateAssumeRoleScript(config)
 
 	// Validate script contains expected elements for source_profile approach
 	if !strings.Contains(script, "#!/bin/bash") {
@@ -209,7 +212,7 @@ func TestGenerateAssumeRoleScriptWithoutExternalID(t *testing.T) {
 		},
 	}
 
-	script := generateAssumeRoleScript(config)
+	script := tekton.GenerateAssumeRoleScript(config)
 
 	// Should have role ARN
 	if !strings.Contains(script, "arn:aws:iam::123456789012:role/my-role") {
@@ -243,7 +246,7 @@ func TestGenerateAssumeRoleScriptWithSessionName(t *testing.T) {
 		},
 	}
 
-	script := generateAssumeRoleScript(config)
+	script := tekton.GenerateAssumeRoleScript(config)
 
 	// Should have the explicit session name
 	if !strings.Contains(script, "role_session_name = my-custom-session") {
@@ -253,7 +256,7 @@ func TestGenerateAssumeRoleScriptWithSessionName(t *testing.T) {
 
 // Test script generation returns empty for nil AssumeRoleConfig
 func TestGenerateScriptWithNilConfig(t *testing.T) {
-	assumeRoleScript := generateAssumeRoleScript(&aws.AWSAuthConfig{})
+	assumeRoleScript := tekton.GenerateAssumeRoleScript(&aws.AWSAuthConfig{})
 	if assumeRoleScript != "" {
 		t.Error("Expected empty script for nil AssumeRoleConfig")
 	}
