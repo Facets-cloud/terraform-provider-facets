@@ -2,12 +2,11 @@ package provider
 
 import (
 	"context"
-	"crypto/md5"
 	"fmt"
-	"os"
 	"regexp"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
+	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -31,7 +30,8 @@ func NewTektonActionKubernetesResource() resource.Resource {
 }
 
 type TektonActionKubernetesResource struct {
-	client dynamic.Interface
+	client     dynamic.Interface
+	operations *tekton.ResourceOperations
 }
 
 type TektonActionKubernetesResourceModel struct {
@@ -47,37 +47,6 @@ type TektonActionKubernetesResourceModel struct {
 	Params             types.List   `tfsdk:"params"`
 	TaskName           types.String `tfsdk:"task_name"`
 	StepActionName     types.String `tfsdk:"step_action_name"`
-}
-
-type FacetsEnvironmentModel struct {
-	UniqueName types.String `tfsdk:"unique_name"`
-}
-
-type FacetsResourceModel struct {
-	Kind types.String `tfsdk:"kind"`
-}
-
-type ParamModel struct {
-	Name types.String `tfsdk:"name"`
-	Type types.String `tfsdk:"type"`
-}
-
-type StepModel struct {
-	Name      types.String `tfsdk:"name"`
-	Image     types.String `tfsdk:"image"`
-	Script    types.String `tfsdk:"script"`
-	Resources types.Object `tfsdk:"resources"`
-	Env       types.List   `tfsdk:"env"`
-}
-
-type ComputeResourcesModel struct {
-	Requests types.Map `tfsdk:"requests"`
-	Limits   types.Map `tfsdk:"limits"`
-}
-
-type EnvVarModel struct {
-	Name  types.String `tfsdk:"name"`
-	Value types.String `tfsdk:"value"`
 }
 
 func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -275,6 +244,7 @@ func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req reso
 	}
 
 	r.client = client
+	r.operations = tekton.NewResourceOperations(client)
 }
 
 func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -291,34 +261,28 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Extract environment unique_name from environment object
-	var facetsEnv FacetsEnvironmentModel
+	var facetsEnv tekton.FacetsEnvironmentModel
 	resp.Diagnostics.Append(plan.FacetsEnvironment.As(ctx, &facetsEnv, basetypes.ObjectAsOptions{})...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	// Extract resource_kind from facets_resource object
-	var facetsRes FacetsResourceModel
+	var facetsRes tekton.FacetsResourceModel
 	resp.Diagnostics.Append(plan.FacetsResource.As(ctx, &facetsRes, basetypes.ObjectAsOptions{})...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	// Generate names using hash for uniqueness
-	taskName, stepActionName := generateResourceNames(
+	names := tekton.GenerateNames(
 		plan.FacetsResourceName.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		plan.Name.ValueString(),
 	)
-	plan.TaskName = types.StringValue(taskName)
-	plan.StepActionName = types.StringValue(stepActionName)
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), taskName))
-
-	// Read cluster_id from environment variable
-	clusterID := os.Getenv("CLUSTER_ID")
-	if clusterID == "" {
-		clusterID = "na"
-	}
+	plan.TaskName = types.StringValue(names.TaskName)
+	plan.StepActionName = types.StringValue(names.StepActionName)
+	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), names.TaskName))
 
 	// Extract custom labels
 	customLabels := make(map[string]string)
@@ -329,20 +293,23 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		}
 	}
 
-	// Create labels (merging custom labels with auto-generated)
-	labels := buildLabels(
+	// Create metadata
+	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		clusterID,
 		false, // cloud_action: false for Kubernetes actions
 		customLabels,
 	)
 
 	// Create StepAction
-	stepAction := r.buildStepAction(plan, labels)
-	if err := r.createResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	stepAction := tekton.BuildKubernetesStepAction(
+		plan.StepActionName.ValueString(),
+		plan.Namespace.ValueString(),
+		metadata.LabelsAsInterface(),
+	)
+	if err := r.operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error creating StepAction",
 			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
@@ -351,12 +318,12 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	}
 
 	// Create Task
-	task := r.buildTask(ctx, plan, labels)
+	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if err := r.createResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := r.operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error creating Task",
 			fmt.Sprintf("Could not create Task: %s", err.Error()),
@@ -409,23 +376,17 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	plan.Namespace = state.Namespace
 
 	// Extract environment unique_name from environment object
-	var facetsEnv FacetsEnvironmentModel
+	var facetsEnv tekton.FacetsEnvironmentModel
 	resp.Diagnostics.Append(plan.FacetsEnvironment.As(ctx, &facetsEnv, basetypes.ObjectAsOptions{})...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	// Extract resource_kind from facets_resource object
-	var facetsRes FacetsResourceModel
+	var facetsRes tekton.FacetsResourceModel
 	resp.Diagnostics.Append(plan.FacetsResource.As(ctx, &facetsRes, basetypes.ObjectAsOptions{})...)
 	if resp.Diagnostics.HasError() {
 		return
-	}
-
-	// Read cluster_id from environment variable
-	clusterID := os.Getenv("CLUSTER_ID")
-	if clusterID == "" {
-		clusterID = "na"
 	}
 
 	// Extract custom labels
@@ -437,20 +398,23 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		}
 	}
 
-	// Create labels (merging custom labels with auto-generated)
-	labels := buildLabels(
+	// Create metadata
+	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		clusterID,
 		false, // cloud_action: false for Kubernetes actions
 		customLabels,
 	)
 
 	// Update StepAction
-	stepAction := r.buildStepAction(plan, labels)
-	if err := r.updateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	stepAction := tekton.BuildKubernetesStepAction(
+		plan.StepActionName.ValueString(),
+		plan.Namespace.ValueString(),
+		metadata.LabelsAsInterface(),
+	)
+	if err := r.operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating StepAction",
 			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
@@ -459,8 +423,8 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	}
 
 	// Update Task
-	task := r.buildTask(ctx, plan, labels)
-	if err := r.updateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
+	if err := r.operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating Task",
 			fmt.Sprintf("Could not update Task: %s", err.Error()),
@@ -480,7 +444,7 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 	}
 
 	// Delete Task
-	if err := r.deleteResource(ctx, state.Namespace.ValueString(), state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := r.operations.DeleteResource(ctx, state.Namespace.ValueString(), state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting Task",
 			fmt.Sprintf("Could not delete Task: %s", err.Error()),
@@ -489,7 +453,7 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 	}
 
 	// Delete StepAction
-	if err := r.deleteResource(ctx, state.Namespace.ValueString(), state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	if err := r.operations.DeleteResource(ctx, state.Namespace.ValueString(), state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting StepAction",
 			fmt.Sprintf("Could not delete StepAction: %s", err.Error()),
@@ -576,114 +540,10 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Helper functions for testability
-
-// generateResourceNames creates deterministic names for Task and StepAction
-// Returns (taskName, stepActionName)
-func generateResourceNames(resourceName, envName, displayName string) (string, string) {
-	hashInput := fmt.Sprintf("%s-%s-%s", resourceName, envName, displayName)
-	nameHash := fmt.Sprintf("%x", md5.Sum([]byte(hashInput)))
-
-	// Build stepActionName with prefix
-	stepActionName := fmt.Sprintf("setup-credentials-%s", nameHash)
-	if len(stepActionName) > 63 {
-		// Keep last 63 chars to preserve unique hash suffix
-		stepActionName = stepActionName[len(stepActionName)-63:]
-	}
-
-	// TaskName is just the hash
-	taskName := nameHash
-	if len(taskName) > 63 {
-		taskName = taskName[len(taskName)-63:]
-	}
-
-	return taskName, stepActionName
-}
-
-// buildLabels creates the standard label map for Tekton resources
-// Custom labels are merged with auto-generated labels, with auto-generated taking precedence
-func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string, cloudAction bool, customLabels map[string]string) map[string]interface{} {
-	labels := make(map[string]interface{})
-
-	// First, add custom labels (if any)
-	for k, v := range customLabels {
-		labels[k] = v
-	}
-
-	// Then, add auto-generated labels (these take precedence)
-	labels["display_name"] = displayName
-	labels["resource_name"] = resourceName
-	labels["resource_kind"] = resourceKind
-	labels["environment_unique_name"] = envUniqueName
-	labels["cluster_id"] = clusterID
-	labels["cloud_action"] = cloudAction
-
-	return labels
-}
-
-// extractMetadata extracts namespace and name from an unstructured object
-// Returns (namespace, name, error)
-func extractMetadata(obj *unstructured.Unstructured) (string, string, error) {
-	metadata, hasMetadata := obj.Object["metadata"]
-	if !hasMetadata {
-		return "", "", fmt.Errorf("no metadata key in object")
-	}
-
-	metadataMap, isMap := metadata.(map[string]interface{})
-	if !isMap {
-		return "", "", fmt.Errorf("metadata is not a map: %T", metadata)
-	}
-
-	namespace, hasNS := metadataMap["namespace"].(string)
-	name, hasName := metadataMap["name"].(string)
-
-	if !hasNS || !hasName || namespace == "" || name == "" {
-		return "", "", fmt.Errorf("missing or empty namespace/name: hasNS=%v ns=%s, hasName=%v name=%s", hasNS, namespace, hasName, name)
-	}
-
-	return namespace, name, nil
-}
-
-func (r *TektonActionKubernetesResource) buildStepAction(plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
-	stepAction := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "tekton.dev/v1beta1",
-			"kind":       "StepAction",
-			"metadata": map[string]interface{}{
-				"name":      plan.StepActionName.ValueString(),
-				"namespace": plan.Namespace.ValueString(),
-				"labels":    labels,
-			},
-			"spec": map[string]interface{}{
-				"image": "facetscloud/actions-base-image:v1.0.0",
-				"script": `#!/bin/bash
-set -e
-mkdir -p /workspace/.kube
-echo -n "$FACETS_USER_KUBECONFIG" | base64 -d > /workspace/.kube/config
-export KUBECONFIG=/workspace/.kube/config
-`,
-				"params": []interface{}{
-					map[string]interface{}{
-						"name": "FACETS_USER_KUBECONFIG",
-						"type": "string",
-					},
-				},
-				"env": []interface{}{
-					map[string]interface{}{
-						"name":  "FACETS_USER_KUBECONFIG",
-						"value": "$(params.FACETS_USER_KUBECONFIG)",
-					},
-				},
-			},
-		},
-	}
-
-	return stepAction
-}
-
+// buildTask creates the Tekton Task for Kubernetes workflows
 func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
-	var steps []StepModel
+	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
 	tektonSteps := []interface{}{
@@ -702,64 +562,8 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 	}
 
 	for _, step := range steps {
-		tektonStep := map[string]interface{}{
-			"name":   step.Name.ValueString(),
-			"image":  step.Image.ValueString(),
-			"script": step.Script.ValueString(),
-		}
-
-		// Add env vars with KUBECONFIG
-		var envVars []EnvVarModel
-		if !step.Env.IsNull() {
-			step.Env.ElementsAs(ctx, &envVars, false)
-		}
-
-		envList := []interface{}{}
-		for _, env := range envVars {
-			envList = append(envList, map[string]interface{}{
-				"name":  env.Name.ValueString(),
-				"value": env.Value.ValueString(),
-			})
-		}
-		envList = append(envList, map[string]interface{}{
-			"name":  "KUBECONFIG",
-			"value": "/workspace/.kube/config",
-		})
-		tektonStep["env"] = envList
-
-		// Add computeResources if provided
-		if !step.Resources.IsNull() {
-			var computeRes ComputeResourcesModel
-			diags := step.Resources.As(ctx, &computeRes, basetypes.ObjectAsOptions{})
-			if diags.HasError() {
-				// Skip this step's resources if conversion fails
-				// The error will be logged but won't fail the entire build
-				continue
-			}
-
-			computeResources := make(map[string]interface{})
-
-			if !computeRes.Requests.IsNull() {
-				requestsMap := make(map[string]string)
-				computeRes.Requests.ElementsAs(ctx, &requestsMap, false)
-				if len(requestsMap) > 0 {
-					computeResources["requests"] = requestsMap
-				}
-			}
-
-			if !computeRes.Limits.IsNull() {
-				limitsMap := make(map[string]string)
-				computeRes.Limits.ElementsAs(ctx, &limitsMap, false)
-				if len(limitsMap) > 0 {
-					computeResources["limits"] = limitsMap
-				}
-			}
-
-			if len(computeResources) > 0 {
-				tektonStep["computeResources"] = computeResources
-			}
-		}
-
+		tektonStep := tekton.BuildStepWithResources(ctx, step)
+		tekton.AddEnvVar(tektonStep, "KUBECONFIG", "/workspace/.kube/config")
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
@@ -777,7 +581,7 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 
 	// Add user-defined params
 	if !plan.Params.IsNull() {
-		var params []ParamModel
+		var params []tekton.ParamModel
 		plan.Params.ElementsAs(ctx, &params, false)
 		for _, param := range params {
 			taskParams = append(taskParams, map[string]interface{}{
@@ -787,75 +591,10 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		}
 	}
 
-	description := plan.TaskName.ValueString()
-	if !plan.Description.IsNull() && plan.Description.ValueString() != "" {
-		description = plan.Description.ValueString()
-	}
-
-	task := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "tekton.dev/v1beta1",
-			"kind":       "Task",
-			"metadata": map[string]interface{}{
-				"name":      plan.TaskName.ValueString(),
-				"namespace": plan.Namespace.ValueString(),
-				"labels":    labels,
-			},
-			"spec": map[string]interface{}{
-				"description": description,
-				"steps":       tektonSteps,
-				"params":      taskParams,
-			},
-		},
-	}
-
-	return task
-}
-
-func (r *TektonActionKubernetesResource) createResource(ctx context.Context, obj *unstructured.Unstructured, group, version, resource string) error {
-	gvr := k8sschema.GroupVersionResource{
-		Group:    group,
-		Version:  version,
-		Resource: resource,
-	}
-
-	namespace := obj.GetNamespace()
-	_, err := r.client.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
-	return err
-}
-
-func (r *TektonActionKubernetesResource) updateResource(ctx context.Context, obj *unstructured.Unstructured, group, version, resource string) error {
-	gvr := k8sschema.GroupVersionResource{
-		Group:    group,
-		Version:  version,
-		Resource: resource,
-	}
-
-	// Extract namespace and name from metadata
-	namespace, name, err := extractMetadata(obj)
-	if err != nil {
-		return err
-	}
-
-	// Get current resource to preserve resourceVersion
-	current, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get current resource %s/%s: %w", namespace, name, err)
-	}
-
-	// Preserve resourceVersion for optimistic locking
-	obj.SetResourceVersion(current.GetResourceVersion())
-
-	_, err = r.client.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
-	return err
-}
-
-func (r *TektonActionKubernetesResource) deleteResource(ctx context.Context, namespace, name, group, version, resource string) error {
-	gvr := k8sschema.GroupVersionResource{
-		Group:    group,
-		Version:  version,
-		Resource: resource,
-	}
-
-	return r.client.Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	return tekton.BuildTask(tekton.TaskSpec{
+		TaskName:    plan.TaskName.ValueString(),
+		Namespace:   plan.Namespace.ValueString(),
+		Description: plan.Description.ValueString(),
+		Labels:      labels,
+	}, tektonSteps, taskParams)
 }
