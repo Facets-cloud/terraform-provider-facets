@@ -27,10 +27,10 @@ func TestGenerateResourceNames(t *testing.T) {
 			expectedHashLen: 32, // MD5 hex = 32 chars
 		},
 		{
-			name:         "long names",
-			resourceName: "very-long-application-name-that-exceeds-kubernetes-limits",
-			envName:      "production-environment-with-long-name",
-			displayName:  "comprehensive-test-action-with-long-display-name",
+			name:            "long names",
+			resourceName:    "very-long-application-name-that-exceeds-kubernetes-limits",
+			envName:         "production-environment-with-long-name",
+			displayName:     "comprehensive-test-action-with-long-display-name",
 			expectedHashLen: 32,
 		},
 	}
@@ -232,11 +232,11 @@ func TestBuildStepAction(t *testing.T) {
 // TestExtractMetadataFromObject tests metadata extraction logic
 func TestExtractMetadataFromObject(t *testing.T) {
 	tests := []struct {
-		name          string
-		object        map[string]interface{}
-		expectError   bool
-		expectedNS    string
-		expectedName  string
+		name         string
+		object       map[string]interface{}
+		expectError  bool
+		expectedNS   string
+		expectedName string
 	}{
 		{
 			name: "valid metadata",
@@ -344,13 +344,13 @@ func TestValidateNamespaceFormat(t *testing.T) {
 		{"a", true},
 		{"123", true},
 		{"a-b-c-d-e-f", true},
-		{"UPPERCASE", false},      // uppercase not allowed
-		{"-start-hyphen", false},  // cannot start with hyphen
-		{"end-hyphen-", false},    // cannot end with hyphen
-		{"under_score", false},    // underscores not allowed
-		{"has space", false},      // spaces not allowed
-		{"special@char", false},   // special chars not allowed
-		{"", false},               // empty not allowed
+		{"UPPERCASE", false},     // uppercase not allowed
+		{"-start-hyphen", false}, // cannot start with hyphen
+		{"end-hyphen-", false},   // cannot end with hyphen
+		{"under_score", false},   // underscores not allowed
+		{"has space", false},     // spaces not allowed
+		{"special@char", false},  // special chars not allowed
+		{"", false},              // empty not allowed
 	}
 
 	// Kubernetes DNS-1123 label regex
@@ -379,12 +379,12 @@ func TestValidateEnvVarName(t *testing.T) {
 		{"_PRIVATE", true},
 		{"__DOUBLE", true},
 		{"A", true},
-		{"lowercase", false},    // lowercase not allowed
-		{"123START", false},     // cannot start with number
-		{"HAS-DASH", false},     // dashes not allowed
-		{"HAS SPACE", false},    // spaces not allowed
-		{"HAS.DOT", false},      // dots not allowed
-		{"", false},             // empty not allowed
+		{"lowercase", false}, // lowercase not allowed
+		{"123START", false},  // cannot start with number
+		{"HAS-DASH", false},  // dashes not allowed
+		{"HAS SPACE", false}, // spaces not allowed
+		{"HAS.DOT", false},   // dots not allowed
+		{"", false},          // empty not allowed
 	}
 
 	envVarRegex := regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)

@@ -126,4 +126,3 @@ func GetAWSConfig(ctx context.Context, providerModel *ProviderModel) (*AWSAuthCo
 		},
 	}, nil
 }
-

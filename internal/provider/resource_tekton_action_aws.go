@@ -597,7 +597,7 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
-	// First step: setup-credentials (references StepAction, no params needed)
+	// Step 1: Setup credentials (references StepAction, no params needed)
 	tektonSteps := []interface{}{
 		map[string]interface{}{
 			"name": "setup-credentials",
@@ -607,11 +607,15 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		},
 	}
 
-	// Add user-defined steps with AWS_CONFIG_FILE env var
+	// Step 2: Setup Facets helpers for output collection
+	tektonSteps = append(tektonSteps, tekton.GenerateSetupHelpersStep())
+
+	// Step 3+: User steps
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
-		// Inject AWS config file path - AWS SDK will use IRSA + source_profile for authentication
 		tekton.AddEnvVar(tektonStep, "AWS_CONFIG_FILE", "/workspace/.aws/config")
+		tekton.PrependPathToStep(tektonStep)
+
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
@@ -633,10 +637,19 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		description = plan.Description.ValueString()
 	}
 
-	return tekton.BuildTask(tekton.TaskSpec{
+	// Build task
+	task := tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
 		Namespace:   plan.Namespace.ValueString(),
 		Description: description,
 		Labels:      labels,
 	}, tektonSteps, taskParams)
+
+	// Add outputs result to task
+	if err := tekton.AddOutputsResultToTask(task); err != nil {
+		// Silently ignore error - outputs result is optional
+		_ = err
+	}
+
+	return task
 }
