@@ -517,22 +517,12 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
-	// Step 1: Setup credentials (inline step)
+	// Step 1: Setup credentials (references StepAction)
 	tektonSteps := []interface{}{
 		map[string]interface{}{
-			"name":  "setup-credentials",
-			"image": "facetscloud/actions-base-image:v1.1.0",
-			"script": `#!/bin/bash
-set -e
-mkdir -p /workspace/.kube
-echo -n "$FACETS_USER_KUBECONFIG" | base64 -d > /workspace/.kube/config
-export KUBECONFIG=/workspace/.kube/config
-`,
-			"env": []interface{}{
-				map[string]interface{}{
-					"name":  "FACETS_USER_KUBECONFIG",
-					"value": "$(params.FACETS_USER_KUBECONFIG)",
-				},
+			"name": "setup-credentials",
+			"ref": map[string]interface{}{
+				"name": plan.StepActionName.ValueString(),
 			},
 		},
 	}
