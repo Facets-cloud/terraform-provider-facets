@@ -517,13 +517,18 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
+	// Step 1: Setup credentials (inline step)
 	tektonSteps := []interface{}{
 		map[string]interface{}{
-			"name": "setup-credentials",
-			"ref": map[string]interface{}{
-				"name": plan.StepActionName.ValueString(),
-			},
-			"params": []interface{}{
+			"name":  "setup-credentials",
+			"image": "facetscloud/actions-base-image:v1.1.0",
+			"script": `#!/bin/bash
+set -e
+mkdir -p /workspace/.kube
+echo -n "$FACETS_USER_KUBECONFIG" | base64 -d > /workspace/.kube/config
+export KUBECONFIG=/workspace/.kube/config
+`,
+			"env": []interface{}{
 				map[string]interface{}{
 					"name":  "FACETS_USER_KUBECONFIG",
 					"value": "$(params.FACETS_USER_KUBECONFIG)",
@@ -532,9 +537,15 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		},
 	}
 
+	// Step 2: Setup Facets helpers for output collection
+	tektonSteps = append(tektonSteps, tekton.GenerateSetupHelpersStep())
+
+	// Step 3+: User steps
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
 		tekton.AddEnvVar(tektonStep, "KUBECONFIG", "/workspace/.kube/config")
+		tekton.PrependPathToStep(tektonStep)
+
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
@@ -562,10 +573,19 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		}
 	}
 
-	return tekton.BuildTask(tekton.TaskSpec{
+	// Build task
+	task := tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
 		Namespace:   plan.Namespace.ValueString(),
 		Description: plan.Description.ValueString(),
 		Labels:      labels,
 	}, tektonSteps, taskParams)
+
+	// Add outputs result to task
+	if err := tekton.AddOutputsResultToTask(task); err != nil {
+		// Silently ignore error - outputs result is optional
+		_ = err
+	}
+
+	return task
 }

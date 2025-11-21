@@ -26,7 +26,7 @@ func BuildAWSStepAction(stepActionName, namespace string, labels map[string]inte
 				"labels":    labels,
 			},
 			"spec": map[string]interface{}{
-				"image":  "facetscloud/actions-base-image:v1.0.0",
+				"image":  "facetscloud/actions-base-image:v1.1.0",
 				"script": script,
 				// No params needed - AWS SDK uses IRSA from pod automatically
 				// No env vars needed - IRSA injected by EKS webhook
@@ -88,9 +88,9 @@ chmod 600 /workspace/.aws/config
 `
 
 	return fmt.Sprintf(script,
-		assumeRole.RoleARN,  // For [default] role_arn (target role)
-		sessionName,         // For [default] role_session_name
-		config.Region,       // For [default] region
+		assumeRole.RoleARN, // For [default] role_arn (target role)
+		sessionName,        // For [default] role_session_name
+		config.Region,      // For [default] region
 	)
 }
 

@@ -17,7 +17,7 @@ func BuildKubernetesStepAction(stepActionName, namespace string, labels map[stri
 				"labels":    labels,
 			},
 			"spec": map[string]interface{}{
-				"image": "facetscloud/actions-base-image:v1.0.0",
+				"image": "facetscloud/actions-base-image:v1.1.0",
 				"script": `#!/bin/bash
 set -e
 mkdir -p /workspace/.kube

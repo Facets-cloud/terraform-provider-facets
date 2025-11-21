@@ -92,6 +92,14 @@ func BuildTask(spec TaskSpec, steps []interface{}, params []interface{}) *unstru
 		description = spec.Description
 	}
 
+	// Define a workspace for sharing files between steps
+	workspaces := []interface{}{
+		map[string]interface{}{
+			"name":        "shared-data",
+			"description": "Workspace for sharing helper scripts and data between steps",
+		},
+	}
+
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "tekton.dev/v1beta1",
@@ -105,6 +113,7 @@ func BuildTask(spec TaskSpec, steps []interface{}, params []interface{}) *unstru
 				"description": description,
 				"steps":       steps,
 				"params":      params,
+				"workspaces":  workspaces,
 			},
 		},
 	}
