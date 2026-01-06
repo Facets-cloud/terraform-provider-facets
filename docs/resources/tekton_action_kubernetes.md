@@ -190,6 +190,47 @@ resource "facets_tekton_action_kubernetes" "scale" {
 }
 ```
 
+### With Custom Labels
+
+```hcl
+resource "facets_tekton_action_kubernetes" "deploy_with_labels" {
+  name                 = "deploy-application"
+  facets_resource_name = "my-app"
+
+  facets_environment = {
+    unique_name = "production"
+  }
+
+  facets_resource = {
+    kind    = "application"
+    flavor  = "k8s"
+    version = "1.0"
+    spec    = {}
+  }
+
+  # Custom labels for tracking and organization
+  labels = {
+    "team"        = "platform"
+    "cost-center" = "engineering"
+    "owner"       = "devops"
+    "tier"        = "critical"
+  }
+
+  steps = [
+    {
+      name  = "deploy"
+      image = "bitnami/kubectl:latest"
+
+      script = <<-EOT
+        #!/bin/bash
+        kubectl apply -f deployment.yaml
+        kubectl rollout status deployment/my-app
+      EOT
+    }
+  ]
+}
+```
+
 ### Multiple Steps
 
 ```hcl
@@ -263,6 +304,7 @@ resource "facets_tekton_action_kubernetes" "ci_pipeline" {
 
 * `description` - (String) Description of the Tekton Task
 * `namespace` - (String) Kubernetes namespace for Tekton resources. Defaults to `"tekton-pipelines"`
+* `labels` - (Map of Strings) Custom labels to apply to the Tekton Task and StepAction resources. These labels are merged with auto-generated labels (`display_name`, `resource_name`, `resource_kind`, `environment_unique_name`, `cluster_id`). Auto-generated labels take precedence and cannot be overwritten.
 * `params` - (List of Objects) List of custom parameters for the Tekton Task. Each parameter has:
   * `name` - (String) Parameter name
   * `type` - (String) Parameter type (e.g., "string", "array")

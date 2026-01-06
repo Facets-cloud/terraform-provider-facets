@@ -42,6 +42,7 @@ type TektonActionKubernetesResourceModel struct {
 	FacetsEnvironment  types.Object `tfsdk:"facets_environment"`
 	FacetsResource     types.Object `tfsdk:"facets_resource"`
 	Namespace          types.String `tfsdk:"namespace"`
+	Labels             types.Map    `tfsdk:"labels"`
 	Steps              types.List   `tfsdk:"steps"`
 	Params             types.List   `tfsdk:"params"`
 	TaskName           types.String `tfsdk:"task_name"`
@@ -153,6 +154,14 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					),
 					stringvalidator.LengthAtMost(63),
 				},
+			},
+			"labels": schema.MapAttribute{
+				Description: "Custom labels to apply to the Tekton Task and StepAction resources. " +
+					"These labels are merged with auto-generated labels (display_name, resource_name, " +
+					"resource_kind, environment_unique_name, cluster_id). Auto-generated labels take " +
+					"precedence and cannot be overwritten.",
+				Optional:    true,
+				ElementType: types.StringType,
 			},
 			"steps": schema.ListNestedAttribute{
 				Description: "List of steps for the Tekton Task",
@@ -311,13 +320,23 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		clusterID = "na"
 	}
 
-	// Create labels
+	// Extract custom labels
+	customLabels := make(map[string]string)
+	if !plan.Labels.IsNull() {
+		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	// Create labels (merging custom labels with auto-generated)
 	labels := buildLabels(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		customLabels,
 	)
 
 	// Create StepAction
@@ -408,13 +427,23 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		clusterID = "na"
 	}
 
-	// Create labels
+	// Extract custom labels
+	customLabels := make(map[string]string)
+	if !plan.Labels.IsNull() {
+		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	// Create labels (merging custom labels with auto-generated)
 	labels := buildLabels(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
 		clusterID,
+		customLabels,
 	)
 
 	// Update StepAction
@@ -570,14 +599,23 @@ func generateResourceNames(resourceName, envName, displayName string) (string, s
 }
 
 // buildLabels creates the standard label map for Tekton resources
-func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string) map[string]interface{} {
-	return map[string]interface{}{
-		"display_name":            displayName,
-		"resource_name":           resourceName,
-		"resource_kind":           resourceKind,
-		"environment_unique_name": envUniqueName,
-		"cluster_id":              clusterID,
+// Custom labels are merged with auto-generated labels, with auto-generated taking precedence
+func buildLabels(displayName, resourceName, resourceKind, envUniqueName, clusterID string, customLabels map[string]string) map[string]interface{} {
+	labels := make(map[string]interface{})
+
+	// First, add custom labels (if any)
+	for k, v := range customLabels {
+		labels[k] = v
 	}
+
+	// Then, add auto-generated labels (these take precedence)
+	labels["display_name"] = displayName
+	labels["resource_name"] = resourceName
+	labels["resource_kind"] = resourceKind
+	labels["environment_unique_name"] = envUniqueName
+	labels["cluster_id"] = clusterID
+
+	return labels
 }
 
 // extractMetadata extracts namespace and name from an unstructured object
