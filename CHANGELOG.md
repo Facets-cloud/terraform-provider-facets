@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-01-14
+
+### Added
+- **Custom Labels Support**: Add optional `labels` attribute to `facets_tekton_action_kubernetes` resource
+  - Allows users to add custom Kubernetes labels to Tekton Task and StepAction resources
+  - Auto-generated labels (display_name, resource_name, resource_kind, environment_unique_name, cluster_id) take precedence over custom labels
+  - Enables better organization and tracking of resources
+
+### Documentation
+- Add comprehensive local testing guide
+- Update resource documentation with custom labels usage examples
+
 ## [0.1.4] - 2024-01-XX
 
 ### Fixed
