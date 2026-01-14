@@ -231,7 +231,12 @@ go test -v ./internal/provider/
 ./tests/integration/test.sh
 ```
 
-See [tests/integration/README.md](tests/integration/README.md) for detailed integration test documentation.
+### Local Testing
+
+For comprehensive local testing instructions including dev overrides, plugin installation, and debugging tips, see:
+
+- [Local Testing Guide](docs/LOCAL_TESTING.md)
+- [Integration Test README](tests/integration/README.md)
 
 ## Project Structure
 

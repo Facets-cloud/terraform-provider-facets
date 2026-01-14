@@ -9,7 +9,7 @@ terraform {
 
 provider "facets" {}
 
-# Example showing a multi-step CI/CD pipeline
+# Example showing a multi-step CI/CD pipeline with custom labels
 resource "facets_tekton_action_kubernetes" "ci_pipeline" {
   name                 = "ci-pipeline"
   description          = "Multi-step CI/CD pipeline"
@@ -24,6 +24,14 @@ resource "facets_tekton_action_kubernetes" "ci_pipeline" {
     flavor  = "k8s"
     version = "1.0"
     spec    = {}
+  }
+
+  # Custom labels for organization and tracking
+  # These merge with auto-generated labels (display_name, resource_name, etc.)
+  labels = {
+    "team"        = "platform"
+    "cost-center" = "engineering"
+    "tier"        = "non-production"
   }
 
   # Multiple steps execute in sequence
