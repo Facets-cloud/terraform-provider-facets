@@ -1,11 +1,19 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"testing"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -464,5 +472,121 @@ func TestValidateEnvVarName(t *testing.T) {
 				t.Errorf("env var %q: got valid=%v, want %v", tt.envVar, isValid, tt.valid)
 			}
 		})
+	}
+}
+
+// namespaceStringAttr returns the namespace schema attribute as a
+// schema.StringAttribute, failing the test if absent or wrong type.
+func namespaceStringAttr(t *testing.T) schema.StringAttribute {
+	t.Helper()
+	r := NewTektonActionKubernetesResource()
+	resp := &resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Schema returned errors: %v", resp.Diagnostics)
+	}
+	attr, ok := resp.Schema.Attributes["namespace"]
+	if !ok {
+		t.Fatal("namespace attribute missing from schema")
+	}
+	stringAttr, ok := attr.(schema.StringAttribute)
+	if !ok {
+		t.Fatalf("namespace attribute should be schema.StringAttribute, got %T", attr)
+	}
+	return stringAttr
+}
+
+// runNamespacePlanModifiers drives the namespace attribute's plan modifiers
+// with a simulated state/plan and returns the resulting response.
+// The plan modifier inspects req.State.Raw / req.Plan.Raw to distinguish
+// create / update / destroy, so we have to build real tfsdk.State and
+// tfsdk.Plan values — not just typed StateValue/PlanValue.
+func runNamespacePlanModifiers(ctx context.Context, t *testing.T, state, planVal string) *planmodifier.StringResponse {
+	t.Helper()
+	r := NewTektonActionKubernetesResource()
+	schemaResp := &resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, schemaResp)
+	if schemaResp.Diagnostics.HasError() {
+		t.Fatalf("Schema returned errors: %v", schemaResp.Diagnostics)
+	}
+	attr, ok := schemaResp.Schema.Attributes["namespace"]
+	if !ok {
+		t.Fatal("namespace attribute missing from schema")
+	}
+	stringAttr, ok := attr.(schema.StringAttribute)
+	if !ok {
+		t.Fatalf("namespace attribute should be schema.StringAttribute, got %T", attr)
+	}
+	if len(stringAttr.PlanModifiers) == 0 {
+		t.Fatal("namespace has no plan modifiers configured")
+	}
+
+	rawType := schemaResp.Schema.Type().TerraformType(ctx)
+	buildRaw := func(val string) tftypes.Value {
+		// Use unknown for fields not relevant to the namespace modifier;
+		// the modifier only inspects namespace value + State/Plan null-ness.
+		fields := map[string]tftypes.Value{}
+		obj := rawType.(tftypes.Object)
+		for name, ft := range obj.AttributeTypes {
+			if name == "namespace" {
+				fields[name] = tftypes.NewValue(tftypes.String, val)
+			} else {
+				fields[name] = tftypes.NewValue(ft, tftypes.UnknownValue)
+			}
+		}
+		return tftypes.NewValue(rawType, fields)
+	}
+
+	tfPlan := tfsdk.Plan{Schema: schemaResp.Schema, Raw: buildRaw(planVal)}
+	tfState := tfsdk.State{Schema: schemaResp.Schema, Raw: buildRaw(state)}
+
+	req := planmodifier.StringRequest{
+		Path:        path.Root("namespace"),
+		Plan:        tfPlan,
+		State:       tfState,
+		StateValue:  types.StringValue(state),
+		PlanValue:   types.StringValue(planVal),
+		ConfigValue: types.StringValue(planVal),
+	}
+	resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+	for _, mod := range stringAttr.PlanModifiers {
+		mod.PlanModifyString(ctx, req, resp)
+	}
+	return resp
+}
+
+// TestNamespaceRequiresReplaceOnChange verifies the namespace plan modifier
+// signals RequiresReplace when the namespace value changes between state
+// and plan. This is the behavior contract: k8s resources cannot be moved
+// between namespaces, so a value change must trigger destroy+recreate.
+func TestNamespaceRequiresReplaceOnChange(t *testing.T) {
+	resp := runNamespacePlanModifiers(context.Background(), t, "tekton-pipelines", "custom-ns")
+	if !resp.RequiresReplace {
+		t.Error("expected RequiresReplace=true when namespace value changes")
+	}
+}
+
+// TestNamespaceNoReplaceWhenUnchanged verifies the namespace plan modifier
+// does NOT signal RequiresReplace when state and plan match.
+func TestNamespaceNoReplaceWhenUnchanged(t *testing.T) {
+	resp := runNamespacePlanModifiers(context.Background(), t, "tekton-pipelines", "tekton-pipelines")
+	if resp.RequiresReplace {
+		t.Error("expected RequiresReplace=false when namespace unchanged")
+	}
+}
+
+// TestNamespaceSchemaShape pins the namespace attribute as Optional+Computed
+// so that the Create-time default ("tekton-pipelines") flow keeps working
+// — Optional lets users omit it, Computed lets the provider fill the default.
+func TestNamespaceSchemaShape(t *testing.T) {
+	stringAttr := namespaceStringAttr(t)
+	if !stringAttr.IsOptional() {
+		t.Error("namespace should be Optional")
+	}
+	if !stringAttr.IsComputed() {
+		t.Error("namespace should be Computed")
+	}
+	if stringAttr.IsRequired() {
+		t.Error("namespace should not be Required")
 	}
 }
