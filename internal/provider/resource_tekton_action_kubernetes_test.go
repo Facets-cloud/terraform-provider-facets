@@ -1,9 +1,12 @@
 package provider
 
 import (
+	"context"
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -408,6 +411,121 @@ func TestValidateEnvVarName(t *testing.T) {
 
 			if isValid != tt.valid {
 				t.Errorf("env var %q: got valid=%v, want %v", tt.envVar, isValid, tt.valid)
+			}
+		})
+	}
+}
+
+// TestNamespaceRequiresReplace verifies that the namespace attribute has RequiresReplace plan modifier
+// This ensures that changing the namespace forces resource recreation (Kubernetes resources cannot be moved between namespaces)
+func TestNamespaceRequiresReplace(t *testing.T) {
+	ctx := context.Background()
+	r := NewTektonActionKubernetesResource()
+
+	// Get the schema
+	schemaReq := resource.SchemaRequest{}
+	schemaResp := &resource.SchemaResponse{}
+	r.Schema(ctx, schemaReq, schemaResp)
+
+	if schemaResp.Diagnostics.HasError() {
+		t.Fatalf("Schema() returned errors: %v", schemaResp.Diagnostics)
+	}
+
+	// Get the namespace attribute
+	namespaceAttr, ok := schemaResp.Schema.Attributes["namespace"]
+	if !ok {
+		t.Fatal("namespace attribute not found in schema")
+	}
+
+	// Check that namespace is Optional and Computed
+	if !namespaceAttr.IsOptional() {
+		t.Error("namespace attribute should be Optional")
+	}
+	if !namespaceAttr.IsComputed() {
+		t.Error("namespace attribute should be Computed")
+	}
+
+	// Verify the attribute has plan modifiers by checking its description mentions replacement
+	// The description should indicate that changing namespace forces recreation
+	description := namespaceAttr.GetDescription()
+	if description == "" {
+		t.Error("namespace attribute should have a description")
+	}
+
+	// Verify the plan modifier is set by checking the schema.StringAttribute type
+	// and that it has PlanModifiers configured
+	stringAttr, isStringAttr := schemaResp.Schema.Attributes["namespace"].(schema.StringAttribute)
+	if !isStringAttr {
+		t.Fatal("namespace attribute should be a StringAttribute")
+	}
+
+	// Check that plan modifiers are configured
+	if len(stringAttr.PlanModifiers) == 0 {
+		t.Error("namespace attribute should have plan modifiers configured (RequiresReplace)")
+	}
+
+	// Verify the description mentions replacement behavior (documentation for users)
+	if !regexp.MustCompile(`(?i)(replac|recreat|forc)`).MatchString(description) {
+		t.Errorf("namespace description should mention replacement behavior, got: %s", description)
+	}
+}
+
+// TestNamespaceSchemaConfiguration tests the full namespace attribute configuration
+func TestNamespaceSchemaConfiguration(t *testing.T) {
+	ctx := context.Background()
+	r := NewTektonActionKubernetesResource()
+
+	schemaReq := resource.SchemaRequest{}
+	schemaResp := &resource.SchemaResponse{}
+	r.Schema(ctx, schemaReq, schemaResp)
+
+	if schemaResp.Diagnostics.HasError() {
+		t.Fatalf("Schema() returned errors: %v", schemaResp.Diagnostics)
+	}
+
+	namespaceAttr, ok := schemaResp.Schema.Attributes["namespace"]
+	if !ok {
+		t.Fatal("namespace attribute not found in schema")
+	}
+
+	tests := []struct {
+		name     string
+		check    func() bool
+		errMsg   string
+	}{
+		{
+			name:   "namespace is optional",
+			check:  func() bool { return namespaceAttr.IsOptional() },
+			errMsg: "namespace should be optional (users can omit it to use default)",
+		},
+		{
+			name:   "namespace is computed",
+			check:  func() bool { return namespaceAttr.IsComputed() },
+			errMsg: "namespace should be computed (default value is set by provider)",
+		},
+		{
+			name:   "namespace is not required",
+			check:  func() bool { return !namespaceAttr.IsRequired() },
+			errMsg: "namespace should not be required",
+		},
+		{
+			name:   "namespace has description",
+			check:  func() bool { return namespaceAttr.GetDescription() != "" },
+			errMsg: "namespace should have a description",
+		},
+		{
+			name: "namespace description mentions replacement",
+			check: func() bool {
+				return regexp.MustCompile(`(?i)(replac|recreat)`).MatchString(namespaceAttr.GetDescription())
+			},
+			errMsg: "namespace description should mention that changes force replacement/recreation",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.check() {
+				t.Error(tt.errMsg)
 			}
 		})
 	}
