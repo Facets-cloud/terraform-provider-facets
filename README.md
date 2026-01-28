@@ -22,15 +22,6 @@ The provider uses the following priority order for Kubernetes authentication:
 
 This ensures that when running inside a Kubernetes cluster, the provider automatically uses the mounted service account token.
 
-## How It Works
-
-When a user triggers an action via the Facets UI:
-
-1. **Facets UI** provides user's kubeconfig (base64-encoded) as `FACETS_USER_KUBECONFIG` parameter
-2. **Credential Setup** step automatically decodes and configures kubectl access
-3. **Your Steps** execute with kubectl configured according to user's RBAC permissions
-4. **Labels** track the action back to Facets blueprint resources
-
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -41,7 +32,7 @@ When a user triggers an action via the Facets UI:
 
 ### `facets_tekton_action_kubernetes`
 
-Creates a Tekton Task and StepAction for Kubernetes-based workflows.
+Creates a Tekton Task and StepAction for Kubernetes-based workflows with automatic credential management.
 
 #### Schema
 
@@ -76,99 +67,78 @@ Creates a Tekton Task and StepAction for Kubernetes-based workflows.
 - `task_name` (String): Generated Tekton Task name
 - `step_action_name` (String): Generated StepAction name
 
-#### Example Usage
+For detailed documentation and examples, see [facets_tekton_action_kubernetes](docs/resources/tekton_action_kubernetes.md).
 
+---
+
+### `facets_tekton_action_aws`
+
+Creates a Tekton Task and StepAction for AWS-based workflows with automatic credential management. Supports both inline credentials and IAM role assumption for enhanced security.
+
+#### Provider Configuration
+
+Configure AWS credentials in the provider block:
+
+**Inline Credentials:**
 ```hcl
-terraform {
-  required_providers {
-    facets = {
-      source = "facets-cloud/facets"
-    }
+provider "facets" {
+  aws = {
+    region     = "us-east-1"
+    access_key = var.aws_access_key
+    secret_key = var.aws_secret_key
   }
-}
-
-provider "facets" {}
-
-resource "facets_tekton_action_kubernetes" "rollout_restart" {
-  name                 = "rollout-restart"
-  description          = "Rollout restart deployments in Kubernetes"
-  facets_resource_name = "my-service"
-
-  facets_environment = {
-    unique_name = "production"
-  }
-
-  facets_resource = {
-    kind    = "service"
-    flavor  = "k8s"
-    version = "1.0"
-    spec    = {}
-  }
-
-  steps = [
-    {
-      name  = "restart-deployments"
-      image = "bitnami/kubectl:latest"
-
-      env = [
-        {
-          name  = "RESOURCE_TYPE"
-          value = "deployment"
-        },
-        {
-          name  = "RESOURCE_NAME"
-          value = "my-app"
-        },
-        {
-          name  = "NAMESPACE"
-          value = "default"
-        }
-      ]
-      script = <<-EOT
-        #!/bin/bash
-        set -e
-        echo "Starting Kubernetes deployment rollout restart workflow..."
-
-        LABEL_SELECTOR="resourceType=$RESOURCE_TYPE,resourceName=$RESOURCE_NAME"
-        DEPLOYMENTS=$(kubectl get deployments -n $NAMESPACE -l "$LABEL_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-
-        if [ -z "$DEPLOYMENTS" ]; then
-          echo "No deployments found"
-          exit 0
-        fi
-
-        while IFS= read -r name; do
-          if [ -n "$name" ]; then
-            kubectl rollout restart deployment "$name" -n "$NAMESPACE"
-            kubectl rollout status deployment "$name" -n "$NAMESPACE" --timeout=300s
-          fi
-        done <<< "$DEPLOYMENTS"
-      EOT
-    }
-  ]
-
 }
 ```
 
-For more detailed documentation and additional examples, see:
-- [Resource Documentation](docs/resources/tekton_action_kubernetes.md)
-- [Examples Directory](examples/)
+**IAM Role Assumption:**
+```hcl
+provider "facets" {
+  aws = {
+    region = "us-east-1"
+    assume_role = {
+      role_arn     = "arn:aws:iam::123456789012:role/TargetRole"
+      session_name = "facets-session"
+      external_id  = "unique-id"  # Optional
+      duration     = 3600          # Optional (900-43200 seconds)
+    }
+  }
+}
+```
 
-## Auto-Injected Parameters
+#### Schema
 
-Every Tekton Task automatically includes these parameters (no need to define them):
+- `name` (String, Required): Display name of the Tekton Task
+- `description` (String, Optional): Description of the Tekton Task
+- `facets_resource_name` (String, Required): Resource name as defined in the Facets blueprint
+- `facets_environment` (Object, Required): Facets-managed environment configuration
+  - `unique_name` (String, Required): Unique name of the environment
+- `facets_resource` (Object, Required): Resource definition as specified in the Facets blueprint
+  - `kind` (String, Required): Resource kind
+  - `flavor` (String, Required): Resource flavor
+  - `version` (String, Required): Resource version
+  - `spec` (Dynamic, Required): Additional resource specifications
+- `namespace` (String, Optional): Kubernetes namespace for Tekton resources (default: "tekton-pipelines")
+- `steps` (List of Objects, Required): List of steps for the Tekton Task
+  - `name` (String, Required): Step name
+  - `image` (String, Required): Container image for the step (should include AWS CLI)
+  - `script` (String, Required): Script to execute in the step
+  - `resources` (Object, Optional): Compute resources for the step
+    - `requests` (Map of Strings, Optional): Minimum compute resources (e.g., cpu, memory)
+    - `limits` (Map of Strings, Optional): Maximum compute resources
+  - `env` (List of Objects, Optional): Environment variables for the step
+    - `name` (String, Required): Environment variable name
+    - `value` (String, Required): Environment variable value
+- `params` (List of Objects, Optional): List of custom parameters for the Tekton Task
+  - `name` (String, Required): Parameter name
+  - `type` (String, Required): Parameter type (e.g., "string", "array")
 
-- `FACETS_USER_EMAIL` - Email of the user triggering the action
-- `FACETS_USER_KUBECONFIG` - Base64-encoded kubeconfig with RBAC permissions
+#### Computed Attributes
 
-These parameters are populated by the Facets UI when the action is triggered.
+- `id` (String): Resource identifier
+- `task_name` (String): Generated Tekton Task name
+- `step_action_name` (String): Generated StepAction name for AWS credential setup
 
-## Auto-Generated Steps
-
-A `setup-credentials` step is automatically prepended to your workflow that:
-- Decodes the base64-encoded kubeconfig
-- Places it at `/workspace/.kube/config`
-- Sets `KUBECONFIG` environment variable for all steps
+For detailed documentation, examples, and authentication methods, see [facets_tekton_action_aws](docs/resources/tekton_action_aws.md).
 
 ## Installation
 
