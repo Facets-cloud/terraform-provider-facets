@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-02-02
+
+### Added
+- **New Resource: `facets_tekton_action_aws`** for AWS workflow automation
+  - IRSA-only authentication with native AWS SDK role chaining via `source_profile`
+  - Session name support (configurable or auto-generated) for CloudTrail tracking
+  - Cross-account access with secure temporary credentials
+  - External ID support for enhanced security
+  - Full CRUD operations with import support
+- **`cloud_action` label** added to all Tekton Task and StepAction resources
+  - `cloud_action=true` for `facets_tekton_action_aws` resources
+  - `cloud_action=false` for `facets_tekton_action_kubernetes` resources
+
+### Changed
+- **Refactored shared Tekton logic** into reusable `internal/provider/tekton/` package
+  - ~70% code duplication eliminated between AWS and Kubernetes actions
+  - Unified naming convention for both resource types
+
+### Documentation
+- Comprehensive documentation for `facets_tekton_action_aws` at `docs/resources/tekton_action_aws.md`
+- Complete working example at `examples/aws/assume-role/`
+- Updated README.md with AWS action schema
+
+### Breaking Changes
+- `facets_tekton_action_aws` requires IRSA-only authentication (no inline credentials)
+- `assume_role` block is required in provider configuration for AWS actions
+- Service account must have IRSA role with `sts:AssumeRole` permission
+
 ## [1.0.0] - 2026-01-14
 
 ### Added
