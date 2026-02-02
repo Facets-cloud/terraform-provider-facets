@@ -36,9 +36,8 @@ func NewTektonActionAWSResource() resource.Resource {
 
 // TektonActionAWSResource manages Tekton Tasks and StepActions for AWS workflows
 type TektonActionAWSResource struct {
-	client       dynamic.Interface
 	providerData *FacetsProviderModel
-	operations   *tekton.ResourceOperations
+	// No cached client - fresh client created per operation for thread safety
 }
 
 // TektonActionAWSResourceModel represents the resource data model
@@ -220,22 +219,12 @@ func (r *TektonActionAWSResource) Schema(ctx context.Context, req resource.Schem
 }
 
 func (r *TektonActionAWSResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
-	// Create Kubernetes client
-	// Note: We need the Kubernetes client because we're creating Tekton CRDs (Tasks, StepActions)
-	// in the control plane cluster. The AWS credentials are only used at Tekton runtime.
-	client, err := k8s.GetKubernetesClient()
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Unable to Create Kubernetes Client",
-			fmt.Sprintf("Failed to create Kubernetes client: %s", err.Error()),
-		)
-		return
-	}
-
-	r.client = client
-	r.operations = tekton.NewResourceOperations(client)
+	// Client will be created lazily when needed during CRUD operations.
+	// This allows terraform validate to pass without requiring a kubeconfig.
 
 	// Store provider data for accessing AWS config during Create/Update
+	// Note: We validate AWS config lazily during CRUD operations, not here,
+	// to allow terraform validate to succeed without AWS credentials.
 	if req.ProviderData != nil {
 		// Type assert to get provider model
 		providerModel, ok := req.ProviderData.(*FacetsProviderModel)
@@ -246,24 +235,19 @@ func (r *TektonActionAWSResource) Configure(ctx context.Context, req resource.Co
 			)
 			return
 		}
-
-		// Convert to aws.ProviderModel for validation
-		// This avoids import cycles while maintaining type safety
-		awsProviderModel := &aws.ProviderModel{
-			AWS: providerModel.AWS,
-		}
-
-		// Validate AWS configuration is present
-		_, err := aws.GetAWSConfig(ctx, awsProviderModel)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"AWS Configuration Error",
-				err.Error(),
-			)
-			return
-		}
 		r.providerData = providerModel
 	}
+}
+
+// getClient returns a fresh Kubernetes client and operations for each call.
+// This pattern matches terraform-provider-helm best practices - no cached state,
+// thread-safe, and avoids stale client issues.
+func (r *TektonActionAWSResource) getClient() (dynamic.Interface, *tekton.ResourceOperations, error) {
+	client, err := k8s.GetKubernetesClient()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+	return client, tekton.NewResourceOperations(client), nil
 }
 
 func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -271,6 +255,16 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Create fresh client for this operation
+	_, operations, err := r.getClient()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to Create Kubernetes Client",
+			err.Error(),
+		)
 		return
 	}
 
@@ -308,6 +302,15 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		nil,  // customLabels: not supported for AWS actions yet
 	)
 
+	// Validate provider data is available
+	if r.providerData == nil {
+		resp.Diagnostics.AddError(
+			"Provider Configuration Error",
+			"Provider data is not configured. Ensure the provider block is properly configured.",
+		)
+		return
+	}
+
 	// Get AWS config
 	awsProviderModel := &aws.ProviderModel{
 		AWS: r.providerData.AWS,
@@ -335,7 +338,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		)
 		return
 	}
-	if err := r.operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error creating StepAction",
 			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
@@ -349,7 +352,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	if err := r.operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error creating Task",
 			fmt.Sprintf("Could not create Task: %s", err.Error()),
@@ -368,6 +371,16 @@ func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
+	// Create fresh client for this operation
+	client, _, err := r.getClient()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to Create Kubernetes Client",
+			err.Error(),
+		)
+		return
+	}
+
 	// Verify Task exists
 	gvr := k8sschema.GroupVersionResource{
 		Group:    "tekton.dev",
@@ -375,7 +388,7 @@ func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadReq
 		Resource: "tasks",
 	}
 
-	_, err := r.client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	_, err = client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		resp.State.RemoveResource(ctx)
 		return
@@ -391,6 +404,16 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Create fresh client for this operation
+	_, operations, err := r.getClient()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to Create Kubernetes Client",
+			err.Error(),
+		)
 		return
 	}
 
@@ -424,6 +447,15 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		nil,  // customLabels: not supported for AWS actions yet
 	)
 
+	// Validate provider data is available
+	if r.providerData == nil {
+		resp.Diagnostics.AddError(
+			"Provider Configuration Error",
+			"Provider data is not configured. Ensure the provider block is properly configured.",
+		)
+		return
+	}
+
 	// Get AWS config
 	awsProviderModel := &aws.ProviderModel{
 		AWS: r.providerData.AWS,
@@ -451,7 +483,7 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		)
 		return
 	}
-	if err := r.operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating StepAction",
 			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
@@ -461,7 +493,7 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 
 	// Update Task
 	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
-	if err := r.operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error updating Task",
 			fmt.Sprintf("Could not update Task: %s", err.Error()),
@@ -480,8 +512,18 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
+	// Create fresh client for this operation
+	_, operations, err := r.getClient()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to Create Kubernetes Client",
+			err.Error(),
+		)
+		return
+	}
+
 	// Delete Task
-	if err := r.operations.DeleteResource(ctx, tektonPipelinesNamespace, state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting Task",
 			fmt.Sprintf("Could not delete Task: %s", err.Error()),
@@ -490,7 +532,7 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 	}
 
 	// Delete StepAction
-	if err := r.operations.DeleteResource(ctx, tektonPipelinesNamespace, state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting StepAction",
 			fmt.Sprintf("Could not delete StepAction: %s", err.Error()),
@@ -511,6 +553,16 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 		taskName = parts[1]
 	}
 
+	// Create fresh client for this operation
+	client, _, err := r.getClient()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to Create Kubernetes Client",
+			err.Error(),
+		)
+		return
+	}
+
 	// Verify Task exists
 	gvr := k8sschema.GroupVersionResource{
 		Group:    "tekton.dev",
@@ -518,7 +570,7 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 		Resource: "tasks",
 	}
 
-	task, err := r.client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, taskName, metav1.GetOptions{})
+	task, err := client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, taskName, metav1.GetOptions{})
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error importing resource",
