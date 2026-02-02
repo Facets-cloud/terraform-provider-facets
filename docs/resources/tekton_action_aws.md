@@ -1,44 +1,26 @@
 # facets_tekton_action_aws
 
-Manages a Tekton Task and StepAction for AWS-based workflows in Facets.
-
-This resource automatically creates:
-- A Tekton Task with your specified workflow steps
-- A StepAction that sets up AWS credentials using IRSA role chaining
+Manages a Tekton Task and StepAction for AWS-based workflows in Facets. This resource automatically sets up AWS credentials using IRSA role chaining, allowing your workflow steps to access AWS services securely.
 
 ## How It Works
 
-The `facets_tekton_action_aws` resource provides automatic AWS credential management through **IRSA (IAM Roles for Service Accounts)** with native AWS SDK role chaining.
+When a user triggers this action via the Facets UI:
 
-### IRSA Role Chaining Flow
+1. **ServiceAccount with IRSA**: The TaskRun executes using the `facets-workflows-sa` ServiceAccount in the `tekton-pipelines` namespace, which has an IRSA role attached via the `eks.amazonaws.com/role-arn` annotation
+2. **Automatic Credential Setup**: A `setup-aws-credentials` step is automatically prepended to your workflow that:
+   - Uses the IRSA credentials to assume the target role (configured in your provider's `assume_role` block)
+   - Configures AWS SDK environment variables for all subsequent steps
+3. **Your Steps Run**: Your defined workflow steps execute with the assumed role's AWS permissions
 
-1. **Configuration**: Pod's ServiceAccount has an IRSA role with `sts:AssumeRole` permission
-2. **Setup Step**: Creates AWS config file with `source_profile` pointing to IRSA credentials
-3. **User Steps**: AWS SDK automatically:
-   - Reads IRSA credentials from environment variables
-   - Uses them to call `sts:AssumeRole` on the target role
-   - Caches and auto-refreshes temporary credentials
-   - All transparent to user workflows
+This enables secure cross-account access without embedding long-lived credentials.
 
-### Authentication Flow
+## Prerequisites
 
-```
-Pod IRSA Role → source_profile → Target Role (with session_name)
-```
+The `facets-workflows-sa` ServiceAccount in the `tekton-pipelines` namespace must be configured with IRSA:
 
-**Key Features**:
-- **Silent setup**: No debug output, production-ready
-- **Automatic credential refresh**: AWS SDK handles token lifecycle
-- **Session tracking**: Configurable session names for CloudTrail
-- **Cross-account access**: Securely assume roles in different AWS accounts
-- **External ID support**: Enhanced security for cross-account scenarios
-
-### Architecture Details
-
-- **No Terraform State Exposure**: AWS configuration is NOT stored in Terraform state. Only Task and StepAction names are tracked.
-- **Credential Location**: AWS config is written to `/workspace/.aws/config` at runtime
-- **No skip-containers needed**: All containers receive the same IRSA credentials
-- **Native SDK behavior**: Uses standard AWS SDK credential chain
+- **IRSA role**: The ServiceAccount must have an `eks.amazonaws.com/role-arn` annotation pointing to an IAM role
+- **AssumeRole permission**: The IRSA role must have `sts:AssumeRole` permission on the target role specified in your provider configuration
+- **Trust policy**: The target role must trust the IRSA role
 
 ## Provider Configuration
 
@@ -56,11 +38,6 @@ provider "facets" {
   }
 }
 ```
-
-**Requirements**:
-- ServiceAccount must have IRSA role configured
-- IRSA role must have `sts:AssumeRole` permission on the target role
-- Target role must trust the IRSA role (via trust policy)
 
 ## Environment Variables
 
@@ -118,7 +95,6 @@ resource "facets_tekton_action_aws" "s3_sync" {
       script = <<-EOT
         #!/bin/bash
         set -e
-        # AWS credentials automatically available via IRSA + source_profile
         echo "Syncing files to S3..."
         aws s3 sync $(params.SOURCE_PATH) s3://$(params.BUCKET_NAME)/ --delete
         echo "Sync completed successfully"
@@ -229,8 +205,6 @@ resource "facets_tekton_action_aws" "ec2_workflow" {
         set -e
         echo "Stopping EC2 instance: $(params.INSTANCE_ID)"
         aws ec2 stop-instances --instance-ids $(params.INSTANCE_ID)
-
-        # Wait for stopped state
         aws ec2 wait instance-stopped --instance-ids $(params.INSTANCE_ID)
         echo "Instance stopped"
       EOT
@@ -244,8 +218,6 @@ resource "facets_tekton_action_aws" "ec2_workflow" {
         set -e
         echo "Starting EC2 instance: $(params.INSTANCE_ID)"
         aws ec2 start-instances --instance-ids $(params.INSTANCE_ID)
-
-        # Wait for running state
         aws ec2 wait instance-running --instance-ids $(params.INSTANCE_ID)
         echo "Instance started successfully"
       EOT
@@ -374,90 +346,6 @@ In addition to all arguments above, the following attributes are exported:
 * `task_name` - Generated Tekton Task name (hash-based, may be truncated to 63 characters)
 * `step_action_name` - Generated StepAction name for AWS credential setup
 
-## AWS Configuration Generated
-
-The setup-credentials StepAction creates the following AWS config file at runtime:
-
-```ini
-[profile irsa]
-web_identity_token_file = /var/run/secrets/eks.amazonaws.com/serviceaccount/token
-role_arn = <POD_IRSA_ROLE_ARN>
-
-[default]
-source_profile = irsa
-role_arn = <TARGET_ROLE_ARN>
-role_session_name = <SESSION_NAME>
-region = <REGION>
-external_id = <EXTERNAL_ID>  # If provided
-```
-
-This configuration enables AWS SDK to automatically:
-1. Use IRSA credentials to authenticate as the pod's IAM role
-2. Assume the target role using those credentials
-3. Use the target role's temporary credentials for all AWS operations
-
-## IAM Requirements
-
-### Control Plane IRSA Role
-
-The pod's IRSA role must have permission to assume the target role:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "sts:AssumeRole",
-    "Resource": "arn:aws:iam::TARGET_ACCOUNT:role/TargetRole"
-  }]
-}
-```
-
-### Target Role Trust Policy
-
-The target role must trust the IRSA role:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/IRSARole"
-    },
-    "Action": "sts:AssumeRole",
-    "Condition": {
-      "StringEquals": {
-        "sts:ExternalId": "my-external-id"  // Optional
-      }
-    }
-  }]
-}
-```
-
-## Session Names
-
-Session names appear in CloudTrail logs and help track who/what assumed the role:
-
-- **Explicit**: Set `session_name` in provider configuration
-- **Auto-generated**: If not provided, generates random name like `terraform-a1b2c3d4e5f6789`
-
-Session names appear in the assumed role ARN:
-```
-arn:aws:sts::123456789012:assumed-role/TargetRole/my-session-name
-```
-
-## Comparison with Kubernetes Action
-
-| Aspect | Kubernetes Action | AWS Action |
-|--------|-------------------|------------|
-| **Credential Setup** | Decodes kubeconfig parameter | Creates AWS config with role chaining |
-| **Credential Source** | Facets UI injects at runtime | Pod IRSA + AWS STS |
-| **Runtime Parameters** | FACETS_USER_KUBECONFIG | None |
-| **Credential Type** | User-specific kubeconfig | Temporary credentials (auto-refreshed) |
-| **Cross-Account** | N/A | Yes |
-| **State Exposure** | No | No |
-
 ## Import
 
 Tekton AWS actions can be imported using the format `namespace/task_name`:
@@ -474,55 +362,31 @@ kubectl get tasks -n tekton-pipelines -l display_name=your-action-name
 
 ## Troubleshooting
 
-### Role Assumption Failures
-
-Check the user step logs (setup step is silent):
+### Check TaskRun Logs
 
 ```bash
 # Find the TaskRun
 kubectl get taskruns -n tekton-pipelines
 
-# Check user step logs
+# Check step logs
 kubectl logs -n tekton-pipelines <taskrun-name> -c step-<step-name>
 ```
 
-Common issues:
-- **AccessDenied**: IRSA role doesn't have `sts:AssumeRole` permission
-- **Not authorized**: Target role's trust policy doesn't allow IRSA role
-- **External ID mismatch**: Check external_id in both provider config and trust policy
+### Common Issues
 
-### IRSA Not Configured
+- **AccessDenied**: IRSA role doesn't have `sts:AssumeRole` permission on the target role
+- **Not authorized**: Target role's trust policy doesn't allow the IRSA role
+- **External ID mismatch**: Verify `external_id` matches in both provider config and target role trust policy
+- **Credentials error**: Verify ServiceAccount has IRSA annotation (`eks.amazonaws.com/role-arn`)
 
-If AWS commands fail with credentials error:
+### Debug Commands
 
-1. Verify ServiceAccount has IRSA annotation:
-   ```bash
-   kubectl get sa <service-account-name> -n <namespace> -o yaml
-   ```
-   Should have: `eks.amazonaws.com/role-arn: arn:aws:iam::...`
-
-2. Check pod environment variables:
-   ```bash
-   kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].env}'
-   ```
-   Should include: `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
-
-### Debug AWS Configuration
-
-Add debug commands to your step script:
+Add these to your step script to troubleshoot:
 
 ```bash
-# Check AWS config file
-cat /workspace/.aws/config
+# Check current identity
+aws sts get-caller-identity
 
 # Check environment variables
 env | grep AWS
-
-# Test AWS SDK credential chain
-aws sts get-caller-identity
 ```
-
-## Examples
-
-For complete working examples, see:
-- [Cross-Account IAM Role Assumption](../../examples/aws/assume-role/)
