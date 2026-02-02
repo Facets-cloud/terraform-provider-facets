@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/aws"
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
@@ -19,6 +20,8 @@ import (
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 )
+
+const tektonPipelinesNamespace = "tekton-pipelines"
 
 var (
 	_ resource.Resource                = &TektonActionAWSResource{}
@@ -47,7 +50,6 @@ type TektonActionAWSResourceModel struct {
 	FacetsResourceName types.String `tfsdk:"facets_resource_name"`
 	FacetsEnvironment  types.Object `tfsdk:"facets_environment"`
 	FacetsResource     types.Object `tfsdk:"facets_resource"`
-	Namespace          types.String `tfsdk:"namespace"`
 	Steps              types.List   `tfsdk:"steps"`
 	Params             types.List   `tfsdk:"params"`
 	TaskName           types.String `tfsdk:"task_name"`
@@ -115,18 +117,6 @@ func (r *TektonActionAWSResource) Schema(ctx context.Context, req resource.Schem
 						Description: "Resource kind (used in resource labels)",
 						Required:    true,
 					},
-				},
-			},
-			"namespace": schema.StringAttribute{
-				Description: "Kubernetes namespace for Tekton resources",
-				Optional:    true,
-				Computed:    true,
-				Validators: []validator.String{
-					stringvalidator.RegexMatches(
-						regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`),
-						"must be a valid Kubernetes namespace name (lowercase alphanumeric and hyphens, cannot start or end with hyphen)",
-					),
-					stringvalidator.LengthAtMost(63),
 				},
 			},
 			"steps": schema.ListNestedAttribute{
@@ -284,11 +274,6 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	// Set defaults
-	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
-		plan.Namespace = types.StringValue("tekton-pipelines")
-	}
-
 	// Extract environment unique_name from environment object
 	var facetsEnv tekton.FacetsEnvironmentModel
 	resp.Diagnostics.Append(plan.FacetsEnvironment.As(ctx, &facetsEnv, basetypes.ObjectAsOptions{})...)
@@ -311,7 +296,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 	)
 	plan.TaskName = types.StringValue(names.TaskName)
 	plan.StepActionName = types.StringValue(names.StepActionName)
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), names.TaskName))
+	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", tektonPipelinesNamespace, names.TaskName))
 
 	// Create metadata (no custom labels for AWS actions currently)
 	metadata := tekton.NewResourceMetadata(
@@ -339,7 +324,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 	// Create StepAction
 	stepAction, err := tekton.BuildAWSStepAction(
 		plan.StepActionName.ValueString(),
-		plan.Namespace.ValueString(),
+		tektonPipelinesNamespace,
 		metadata.LabelsAsInterface(),
 		awsConfig,
 	)
@@ -390,7 +375,7 @@ func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadReq
 		Resource: "tasks",
 	}
 
-	_, err := r.client.Resource(gvr).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	_, err := r.client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		resp.State.RemoveResource(ctx)
 		return
@@ -414,7 +399,6 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 	plan.StepActionName = state.StepActionName
 	plan.TaskName = state.TaskName
 	plan.ID = state.ID
-	plan.Namespace = state.Namespace
 
 	// Extract environment unique_name from environment object
 	var facetsEnv tekton.FacetsEnvironmentModel
@@ -456,7 +440,7 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 	// Update StepAction
 	stepAction, err := tekton.BuildAWSStepAction(
 		plan.StepActionName.ValueString(),
-		plan.Namespace.ValueString(),
+		tektonPipelinesNamespace,
 		metadata.LabelsAsInterface(),
 		awsConfig,
 	)
@@ -497,7 +481,7 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 	}
 
 	// Delete Task
-	if err := r.operations.DeleteResource(ctx, state.Namespace.ValueString(), state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
+	if err := r.operations.DeleteResource(ctx, tektonPipelinesNamespace, state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting Task",
 			fmt.Sprintf("Could not delete Task: %s", err.Error()),
@@ -506,7 +490,7 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 	}
 
 	// Delete StepAction
-	if err := r.operations.DeleteResource(ctx, state.Namespace.ValueString(), state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	if err := r.operations.DeleteResource(ctx, tektonPipelinesNamespace, state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting StepAction",
 			fmt.Sprintf("Could not delete StepAction: %s", err.Error()),
@@ -516,20 +500,16 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 }
 
 func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import format: namespace/taskName
+	// Import format: taskName or namespace/taskName (namespace is ignored, always uses tekton-pipelines)
+	// Example: 59f6f855860ddc99a32e2944c96db5fa
 	// Example: tekton-pipelines/59f6f855860ddc99a32e2944c96db5fa
 
-	idParts := regexp.MustCompile(`^([^/]+)/([^/]+)$`).FindStringSubmatch(req.ID)
-	if len(idParts) != 3 {
-		resp.Diagnostics.AddError(
-			"Invalid Import ID",
-			fmt.Sprintf("Expected import ID in format: namespace/taskName, got: %s", req.ID),
-		)
-		return
+	taskName := req.ID
+	// Support legacy format namespace/taskName - extract just the task name
+	if strings.Contains(req.ID, "/") {
+		parts := strings.SplitN(req.ID, "/", 2)
+		taskName = parts[1]
 	}
-
-	namespace := idParts[1]
-	taskName := idParts[2]
 
 	// Verify Task exists
 	gvr := k8sschema.GroupVersionResource{
@@ -538,11 +518,11 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 		Resource: "tasks",
 	}
 
-	task, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, taskName, metav1.GetOptions{})
+	task, err := r.client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, taskName, metav1.GetOptions{})
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error importing resource",
-			fmt.Sprintf("Could not find Task %s/%s: %s", namespace, taskName, err.Error()),
+			fmt.Sprintf("Could not find Task %s/%s: %s", tektonPipelinesNamespace, taskName, err.Error()),
 		)
 		return
 	}
@@ -575,10 +555,9 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 
 	// Set state with imported values
 	state := TektonActionAWSResourceModel{
-		ID:                 types.StringValue(fmt.Sprintf("%s/%s", namespace, taskName)),
+		ID:                 types.StringValue(fmt.Sprintf("%s/%s", tektonPipelinesNamespace, taskName)),
 		Name:               types.StringValue(displayName),
 		FacetsResourceName: types.StringValue(resourceName),
-		Namespace:          types.StringValue(namespace),
 		TaskName:           types.StringValue(taskName),
 		StepActionName:     types.StringValue(stepActionName),
 	}
@@ -637,7 +616,7 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
-		Namespace:   plan.Namespace.ValueString(),
+		Namespace:   tektonPipelinesNamespace,
 		Description: description,
 		Labels:      labels,
 	}, tektonSteps, taskParams)
