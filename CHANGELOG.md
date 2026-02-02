@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-02-02
+
+### Changed
+- **Refactored Kubernetes client initialization** to create fresh client per operation
+  - Matches terraform-provider-helm best practices for client management
+  - No stale client issues - fresh client ensures latest config/credentials
+  - Thread-safe - no shared mutable state between operations
+  - `terraform validate` and `terraform plan` now succeed without kubeconfig
+  - Client errors only occur during actual CRUD operations (`terraform apply`)
+
+### Fixed
+- Added nil pointer protection for provider data in AWS resource
+  - Prevents panic if provider block is misconfigured
+  - Returns clear error message instead of crashing
+
+### Technical Details
+This is an internal refactoring with no schema changes. User configurations remain unchanged.
+The provider now defers all client creation and validation to CRUD operations, allowing
+CI pipelines to validate Terraform configurations without requiring Kubernetes credentials.
+
 ## [1.1.1] - 2026-02-02
 
 ### Documentation
