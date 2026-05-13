@@ -162,3 +162,84 @@ func TestK8sReadResourceState_StepActionMissing_AsymmetricDriftSurfaced(t *testi
 		t.Errorf("expected a diagnostic (error or warning) surfacing asymmetric drift (post-fix); got none")
 	}
 }
+
+// TestK8sUpdate_TaskFails_StepActionUntouched asserts the POST-FIX
+// behavior for Update ordering (Unni's review, PR #12 Critique 2).
+// The fix reorders updateResources to update Task FIRST, then
+// StepAction. When Task update fails, StepAction is never touched —
+// the cluster remains in a coherent pre-Update state and no field-level
+// divergence is introduced.
+//
+// FAILS on `main` (current order is SA-first → Task, so SA is updated
+// to v=2 before Task-update-fail is detected). PASSES after the
+// Task-first reorder fix lands.
+func TestK8sUpdate_TaskFails_StepActionUntouched(t *testing.T) {
+	// Seed both objects with v=1.
+	oldTask := testfake.Task(k8sReadTestNamespace, k8sTaskName, map[string]string{"v": "1"})
+	oldSA := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, map[string]string{"v": "1"})
+	r, c := resourceWithFake(oldTask, oldSA)
+
+	// Inject Task-update failure only — StepAction update would succeed
+	// if reached, which is exactly the bug.
+	testfake.WithError(c, "update", testfake.TaskGVR, testfake.ErrInternalServer("etcd unavailable"))
+
+	// Plan would have these as v=2.
+	newSA := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, map[string]string{"v": "2"})
+	newTask := testfake.Task(k8sReadTestNamespace, k8sTaskName, map[string]string{"v": "2"})
+	ops := tekton.NewResourceOperations(c)
+
+	diags := r.updateResources(context.Background(), ops, newSA, newTask)
+	if !diags.HasError() {
+		t.Fatal("expected Task-update error to surface")
+	}
+
+	// Post-fix invariant: StepAction must be at OLD spec (v=1).
+	saInCluster, err := c.Resource(testfake.StepActionGVR).Namespace(k8sReadTestNamespace).Get(context.Background(), k8sStepActionName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("StepAction missing from cluster: %v", err)
+	}
+	if got := saInCluster.GetLabels()["v"]; got != "1" {
+		t.Errorf("BUG: StepAction was updated to v=%q before Task-update-fail. "+
+			"Post-fix invariant requires StepAction at v=1 (untouched). "+
+			"FAILS on main until the Task-first reorder fix lands.", got)
+	}
+}
+
+// TestK8sCreate_TaskFailsAndRollbackFails_BothDiagnosticsSurface locks
+// the rollback-failure diagnostic contract. When the StepAction rollback
+// itself fails (Forbidden, persistent 5xx, etc.) after a Task-create
+// failure, BOTH diagnostics must surface so the operator sees the
+// original cause AND knows manual cleanup may be required.
+//
+// Passes today (fix #10 produces both diagnostics). The cluster still
+// has the orphan StepAction; that pathological case is what the
+// follow-up IsAlreadyExists-adopt fix (Unni Critique 1) will address.
+func TestK8sCreate_TaskFailsAndRollbackFails_BothDiagnosticsSurface(t *testing.T) {
+	r, c := resourceWithFake()
+	// Task create fails.
+	testfake.WithError(c, "create", testfake.TaskGVR, testfake.ErrInternalServer("etcd unavailable"))
+	// AND the rollback Delete also fails.
+	testfake.WithError(c, "delete", testfake.StepActionGVR, testfake.ErrForbidden(testfake.StepActionGVR, k8sStepActionName))
+
+	stepAction := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, nil)
+	task := testfake.Task(k8sReadTestNamespace, k8sTaskName, nil)
+	ops := tekton.NewResourceOperations(c)
+
+	diags := r.createResources(context.Background(), ops, stepAction, task)
+
+	if !diags.HasError() {
+		t.Fatal("expected Task-create error to surface")
+	}
+	if diags.WarningsCount() == 0 {
+		t.Errorf("expected a warning surfacing the rollback failure; got none")
+	}
+
+	// Document the known orphan: StepAction is still in cluster because
+	// both the original create succeeded AND the rollback delete failed.
+	// The follow-up IsAlreadyExists-adopt fix will address this on the
+	// next apply by adopting via Update.
+	if _, err := c.Resource(testfake.StepActionGVR).Namespace(k8sReadTestNamespace).Get(context.Background(), k8sStepActionName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected orphan StepAction (rollback failed), got err=%v. "+
+			"If this test fails, the rollback-failure path may have changed.", err)
+	}
+}

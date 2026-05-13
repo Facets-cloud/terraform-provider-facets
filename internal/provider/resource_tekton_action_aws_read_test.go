@@ -139,6 +139,31 @@ func TestAWSReadResourceState_TaskGetContextCanceled_StateRetainedAndErrorSurfac
 	}
 }
 
+// TestAWSReadResourceState_TaskMissing_StepActionPresent_AsymmetricDriftSurfaced
+// mirrors TestAWSReadResourceState_StepActionMissing_AsymmetricDriftSurfaced
+// for the opposite asymmetric branch. Passes today; serves as a regression
+// guard so a future refactor can't accidentally drop coverage of the
+// Task-missing / StepAction-present case (AWS variant).
+func TestAWSReadResourceState_TaskMissing_StepActionPresent_AsymmetricDriftSurfaced(t *testing.T) {
+	// Only the StepAction is seeded — Task is intentionally missing.
+	sa := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, nil)
+	r, c := awsResourceWithFake(sa)
+
+	// The state model needs the StepActionName populated for the
+	// existence check on StepAction to find it.
+	state := awsStateForRead(awsReadTestTaskName)
+	state.StepActionName = types.StringValue(awsStepActionName)
+
+	remove, diags := r.readResourceState(context.Background(), c, state)
+
+	if remove {
+		t.Errorf("expected state retained on asymmetric drift (post-fix), got removeFromState=true")
+	}
+	if !diags.HasError() && diags.WarningsCount() == 0 {
+		t.Errorf("expected a diagnostic (error or warning) surfacing asymmetric drift; got none")
+	}
+}
+
 // --- Factory seam smoke test --------------------------------------------
 
 func TestAWSResource_FactorySeam_InjectsFakeClient(t *testing.T) {

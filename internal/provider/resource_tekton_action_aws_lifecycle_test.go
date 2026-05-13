@@ -98,3 +98,44 @@ func TestAWSReadResourceState_StepActionMissing_AsymmetricDriftSurfaced(t *testi
 		t.Errorf("expected a diagnostic (error or warning) surfacing asymmetric drift (post-fix); got none")
 	}
 }
+
+// TestAWSUpdate_TaskFails_StepActionUntouched asserts the POST-FIX
+// behavior for Update ordering (Unni's review, PR #12 Critique 2) on
+// the AWS variant. The fix reorders updateResources to update Task FIRST,
+// then StepAction. When Task update fails, StepAction is never touched —
+// the cluster remains in a coherent pre-Update state.
+//
+// FAILS on `main` (current order is SA-first → Task, so SA is updated
+// to v=2 before Task-update-fail is detected). PASSES after the
+// Task-first reorder fix lands.
+func TestAWSUpdate_TaskFails_StepActionUntouched(t *testing.T) {
+	// Seed both objects with v=1.
+	oldTask := testfake.Task(tektonPipelinesNamespace, awsTaskName, map[string]string{"v": "1"})
+	oldSA := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, map[string]string{"v": "1"})
+	r, c := awsResourceWithFake(oldTask, oldSA)
+
+	// Inject Task-update failure only — StepAction update would succeed
+	// if reached, which is exactly the bug.
+	testfake.WithError(c, "update", testfake.TaskGVR, testfake.ErrInternalServer("etcd unavailable"))
+
+	// Plan would have these as v=2.
+	newSA := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, map[string]string{"v": "2"})
+	newTask := testfake.Task(tektonPipelinesNamespace, awsTaskName, map[string]string{"v": "2"})
+	ops := tekton.NewResourceOperations(c)
+
+	diags := r.updateResources(context.Background(), ops, newSA, newTask)
+	if !diags.HasError() {
+		t.Fatal("expected Task-update error to surface")
+	}
+
+	// Post-fix invariant: StepAction must be at OLD spec (v=1).
+	saInCluster, err := c.Resource(testfake.StepActionGVR).Namespace(tektonPipelinesNamespace).Get(context.Background(), awsStepActionName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("StepAction missing from cluster: %v", err)
+	}
+	if got := saInCluster.GetLabels()["v"]; got != "1" {
+		t.Errorf("BUG: StepAction was updated to v=%q before Task-update-fail. "+
+			"Post-fix invariant requires StepAction at v=1 (untouched). "+
+			"FAILS on main until the Task-first reorder fix lands.", got)
+	}
+}

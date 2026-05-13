@@ -203,3 +203,36 @@ func TestGetResource_NotFound_ErrorPropagates(t *testing.T) {
 // metav1GetOptions returns a zero-value GetOptions; thin wrapper to avoid
 // importing metav1 across every test.
 func metav1GetOptions() metav1.GetOptions { return metav1.GetOptions{} }
+
+// TestCreateResource_AlreadyExists_AdoptsExistingViaUpdate asserts the
+// POST-FIX behavior for the rollback-failure recovery path (Unni's review,
+// PR #12 Critique 1). When CreateResource is called against a cluster
+// where the object already exists (because a prior attempt's rollback
+// failed, or because the deterministic-hash name collided), it must
+// adopt the existing object by Updating it in-place to the new spec
+// rather than returning AlreadyExists. This is safe because the name is
+// a deterministic MD5 of (resource_name, environment, display_name) —
+// a collision IS the same logical resource.
+//
+// FAILS on `main` (CreateResource returns AlreadyExists).
+// PASSES after the IsAlreadyExists-adopt follow-up fix lands.
+func TestCreateResource_AlreadyExists_AdoptsExistingViaUpdate(t *testing.T) {
+	existing := testfake.StepAction(testNamespace, "setup-credentials-1", map[string]string{"v": "1"})
+	c := testfake.NewClient(existing)
+	ops := NewResourceOperations(c)
+
+	incoming := testfake.StepAction(testNamespace, "setup-credentials-1", map[string]string{"v": "2"})
+	err := ops.CreateResource(context.Background(), incoming, "tekton.dev", "v1beta1", "stepactions")
+	if err != nil {
+		t.Fatalf("expected CreateResource to adopt existing object via Update (return nil), got err=%v. "+
+			"This test asserts post-fix behavior; FAILS on main until the IsAlreadyExists-adopt fix lands.", err)
+	}
+
+	got, getErr := c.Resource(testfake.StepActionGVR).Namespace(testNamespace).Get(context.Background(), "setup-credentials-1", metav1GetOptions())
+	if getErr != nil {
+		t.Fatalf("could not read back StepAction after adopt: %v", getErr)
+	}
+	if got.GetLabels()["v"] != "2" {
+		t.Errorf("expected adopted StepAction to have new spec (v=2), got v=%q", got.GetLabels()["v"])
+	}
+}

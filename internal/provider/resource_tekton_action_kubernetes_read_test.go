@@ -168,6 +168,31 @@ func TestK8sReadResourceState_TaskGetContextCanceled_StateRetainedAndErrorSurfac
 
 // --- Factory seam smoke test (Option B verification) --------------------
 
+// TestK8sReadResourceState_TaskMissing_StepActionPresent_AsymmetricDriftSurfaced
+// mirrors TestK8sReadResourceState_StepActionMissing_AsymmetricDriftSurfaced
+// for the opposite asymmetric branch. Passes today; serves as a regression
+// guard so a future refactor can't accidentally drop coverage of the
+// Task-missing / StepAction-present case.
+func TestK8sReadResourceState_TaskMissing_StepActionPresent_AsymmetricDriftSurfaced(t *testing.T) {
+	// Only the StepAction is seeded — Task is intentionally missing.
+	sa := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, nil)
+	r, c := resourceWithFake(sa)
+
+	// The state model needs the StepActionName populated for the
+	// existence check on StepAction to find it.
+	state := stateForRead(k8sReadTestNamespace, k8sReadTestTaskName)
+	state.StepActionName = types.StringValue(k8sStepActionName)
+
+	remove, diags := r.readResourceState(context.Background(), c, state)
+
+	if remove {
+		t.Errorf("expected state retained on asymmetric drift (post-fix), got removeFromState=true")
+	}
+	if !diags.HasError() && diags.WarningsCount() == 0 {
+		t.Errorf("expected a diagnostic (error or warning) surfacing asymmetric drift; got none")
+	}
+}
+
 func TestK8sResource_FactorySeam_InjectsFakeClient(t *testing.T) {
 	called := false
 	fakeClient := testfake.NewClient()
