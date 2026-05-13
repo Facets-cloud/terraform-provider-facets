@@ -359,10 +359,11 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 // diagnostics. Extracted from Create so unit tests can exercise the
 // orphan-on-Task-fail path with a fake dynamic client.
 //
-// CURRENT BUG (issue #10 / Bug #1): if Task creation fails after StepAction
-// creation succeeded, no rollback is performed — the StepAction remains in
-// cluster permanently as an orphan. The fix in #10 will roll back the
-// StepAction here.
+// Fix for issue #10 / Bug #1: if Task creation fails after StepAction
+// creation succeeded, the StepAction is rolled back via DeleteResource
+// (which is idempotent on NotFound per fix #11). If rollback itself fails,
+// a warning is surfaced alongside the original Task-create error so the
+// operator knows manual cleanup may be required.
 func (r *TektonActionKubernetesResource) createResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
@@ -373,11 +374,25 @@ func (r *TektonActionKubernetesResource) createResources(ctx context.Context, op
 		return diags
 	}
 	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+		// Roll back the StepAction we just created so it doesn't orphan in cluster.
+		// DeleteResource is idempotent on NotFound (per fix #11), so this is safe
+		// even if the StepAction is somehow already gone.
+		if rollbackErr := operations.DeleteResource(
+			ctx,
+			stepAction.GetNamespace(),
+			stepAction.GetName(),
+			"tekton.dev", "v1beta1", "stepactions",
+		); rollbackErr != nil {
+			diags.AddWarning(
+				"Rollback of orphaned StepAction failed",
+				fmt.Sprintf("Task creation failed; could not clean up StepAction %s/%s: %s. Manual cleanup may be required.",
+					stepAction.GetNamespace(), stepAction.GetName(), rollbackErr.Error()),
+			)
+		}
 		diags.AddError(
 			"Error creating Task",
 			fmt.Sprintf("Could not create Task: %s", err.Error()),
 		)
-		// BUG #1: StepAction created above is left in cluster as orphan.
 		return diags
 	}
 	return diags
@@ -561,10 +576,10 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 // diagnostics. Extracted from Update so unit tests can exercise the
 // divergence-on-Task-fail path with a fake dynamic client.
 //
-// CURRENT BUG (issue #10 / Bug #4): if Task update fails after StepAction
-// update succeeded, the in-cluster StepAction has new content but the Task
-// has old content — divergent silently. The fix in #10 will surface a loud
-// diagnostic (or attempt snapshot-restore) here.
+// Fix for issue #10 / Bug #4: if Task update fails after StepAction update
+// succeeded, a loud diagnostic is surfaced describing the divergent cluster
+// state so the operator knows manual recovery is required. Snapshot-restore
+// of the StepAction is out of scope for this fix (tracked separately).
 func (r *TektonActionKubernetesResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
@@ -576,10 +591,17 @@ func (r *TektonActionKubernetesResource) updateResources(ctx context.Context, op
 	}
 	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		diags.AddError(
-			"Error updating Task",
-			fmt.Sprintf("Could not update Task: %s", err.Error()),
+			"Cluster state divergent — Task update failed after StepAction succeeded",
+			fmt.Sprintf(
+				"The StepAction %s/%s was updated successfully but the Task %s/%s update failed: %s. "+
+					"The cluster state is now DIVERGENT from Terraform state: the StepAction has the new desired configuration "+
+					"but the Task retains the old. Manual recovery required — re-run the apply once the underlying issue is "+
+					"resolved, or run `terraform refresh` to re-sync state with cluster.",
+				stepAction.GetNamespace(), stepAction.GetName(),
+				task.GetNamespace(), task.GetName(),
+				err.Error(),
+			),
 		)
-		// BUG #4: StepAction updated above remains divergent from old Task.
 		return diags
 	}
 	return diags
