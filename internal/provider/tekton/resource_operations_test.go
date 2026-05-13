@@ -41,21 +41,6 @@ func TestCreateResource_Success(t *testing.T) {
 	}
 }
 
-func TestCreateResource_AlreadyExists_ErrorPropagates(t *testing.T) {
-	existing := testfake.Task(testNamespace, "task-1", nil)
-	c := testfake.NewClient(existing)
-	ops := NewResourceOperations(c)
-
-	dup := testfake.Task(testNamespace, "task-1", nil)
-	err := ops.CreateResource(context.Background(), dup, "tekton.dev", "v1beta1", "tasks")
-	if err == nil {
-		t.Fatal("expected AlreadyExists error, got nil")
-	}
-	if !apierrors.IsAlreadyExists(err) {
-		t.Errorf("expected AlreadyExists, got %T: %v", err, err)
-	}
-}
-
 // --- UpdateResource -------------------------------------------------------
 
 func TestUpdateResource_Success(t *testing.T) {

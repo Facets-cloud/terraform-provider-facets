@@ -608,33 +608,35 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-// updateResources updates the StepAction and Task in cluster. Mirrors the K8s variant.
+// updateResources updates the Task and StepAction in cluster. Mirrors the K8s variant.
 //
-// Fix for issue #10 / Bug #4: if Task update fails after StepAction update
-// succeeded, a loud diagnostic is surfaced describing the divergent cluster
-// state so the operator knows manual recovery is required. Snapshot-restore
-// of the StepAction is out of scope for this fix (tracked separately).
+// Task-first ordering rationale: updating Task before StepAction ensures that
+// if Task update fails (validation, RBAC, webhook), the StepAction is never
+// touched and the cluster remains in a coherent pre-Update state — zero
+// divergence. If Task succeeds but StepAction fails, the cluster is still
+// functional because the Task references the StepAction by immutable ref.name;
+// the old StepAction spec still resolves. The operator re-runs to retry the
+// StepAction update only.
 func (r *TektonActionAWSResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
 	var diags diag.Diagnostics
-	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+	// Update Task FIRST. If it fails (validation, RBAC, webhook), the StepAction
+	// is never touched and the cluster remains in a coherent pre-Update state.
+	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
 		diags.AddError(
-			"Error updating StepAction",
-			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
+			"Error updating Task",
+			fmt.Sprintf("Could not update Task: %s", err.Error()),
 		)
 		return diags
 	}
-	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+	// Task already updated. If StepAction update fails the cluster is still
+	// functional — the Task references the StepAction by immutable ref.name,
+	// and the StepAction at its old spec still resolves. Operator re-runs to
+	// retry the StepAction update.
+	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		diags.AddError(
-			"Cluster state divergent — Task update failed after StepAction succeeded",
-			fmt.Sprintf(
-				"The StepAction %s/%s was updated successfully but the Task %s/%s update failed: %s. "+
-					"The cluster state is now DIVERGENT from Terraform state: the StepAction has the new desired configuration "+
-					"but the Task retains the old. Manual recovery required — re-run the apply once the underlying issue is "+
-					"resolved, or run `terraform refresh` to re-sync state with cluster.",
-				stepAction.GetNamespace(), stepAction.GetName(),
-				task.GetNamespace(), task.GetName(),
-				err.Error(),
-			),
+			"Error updating StepAction",
+			fmt.Sprintf("Task updated successfully but StepAction update failed: %s. "+
+				"Re-run terraform apply to retry the StepAction update.", err.Error()),
 		)
 		return diags
 	}
@@ -659,23 +661,34 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	// Delete Task
-	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error deleting Task",
-			fmt.Sprintf("Could not delete Task: %s", err.Error()),
-		)
-		return
-	}
+	resp.Diagnostics.Append(r.deleteResources(ctx, operations, tektonPipelinesNamespace, state.TaskName.ValueString(), state.StepActionName.ValueString())...)
+}
 
-	// Delete StepAction
-	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error deleting StepAction",
-			fmt.Sprintf("Could not delete StepAction: %s", err.Error()),
+// deleteResources attempts to delete both the Task and the StepAction, using
+// best-effort semantics — if one fails, the other is still attempted, and both
+// errors are aggregated into the returned diagnostics. Combined with the
+// idempotent DeleteResource (which treats NotFound as success), this means
+// destroy retries are safe.
+//
+// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
+// (the AWS model has no Namespace field).
+func (r *TektonActionAWSResource) deleteResources(ctx context.Context, operations *tekton.ResourceOperations, namespace, taskName, stepActionName string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	taskErr := operations.DeleteResource(ctx, namespace, taskName, "tekton.dev", "v1beta1", "tasks")
+	stepActionErr := operations.DeleteResource(ctx, namespace, stepActionName, "tekton.dev", "v1beta1", "stepactions")
+	if taskErr != nil {
+		diags.AddError(
+			"Error deleting Task",
+			fmt.Sprintf("Could not delete Task: %s", taskErr.Error()),
 		)
-		return
 	}
+	if stepActionErr != nil {
+		diags.AddError(
+			"Error deleting StepAction",
+			fmt.Sprintf("Could not delete StepAction: %s", stepActionErr.Error()),
+		)
+	}
+	return diags
 }
 
 func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {

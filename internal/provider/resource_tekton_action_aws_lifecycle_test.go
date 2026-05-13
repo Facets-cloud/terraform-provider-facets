@@ -46,38 +46,6 @@ func TestAWSCreate_TaskFails_RollsBackStepAction(t *testing.T) {
 
 // --- Bug #4 (AWS): Update divergence on Task fail -----------------------
 
-// TestAWSUpdate_TaskFails_SurfacesDivergenceDiagnostic asserts the POST-FIX
-// behavior for Bug #4 / issue #10 on the AWS variant: when Task update
-// fails after StepAction update succeeded, a diagnostic must explicitly
-// surface the divergence. Uses diagsContainKeyword (defined in the K8s
-// lifecycle test file — same package).
-//
-// FAILS on `main`; passes once issue #10 fix lands.
-func TestAWSUpdate_TaskFails_SurfacesDivergenceDiagnostic(t *testing.T) {
-	oldTask := testfake.Task(tektonPipelinesNamespace, awsTaskName, map[string]string{"v": "1"})
-	oldSA := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, map[string]string{"v": "1"})
-	r, c := awsResourceWithFake(oldTask, oldSA)
-
-	testfake.WithError(c, "update", testfake.TaskGVR, testfake.ErrInternalServer("etcd unavailable"))
-
-	newSA := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, map[string]string{"v": "2"})
-	newTask := testfake.Task(tektonPipelinesNamespace, awsTaskName, map[string]string{"v": "2"})
-	ops := tekton.NewResourceOperations(c)
-
-	diags := r.updateResources(context.Background(), ops, newSA, newTask)
-	if !diags.HasError() {
-		t.Fatal("expected Task-update error to surface")
-	}
-
-	hasDivergenceKeyword := diagsContainKeyword(diags, "divergent") ||
-		diagsContainKeyword(diags, "divergence") ||
-		diagsContainKeyword(diags, "manual") ||
-		diagsContainKeyword(diags, "cluster state")
-	if !hasDivergenceKeyword {
-		t.Errorf("expected diagnostics to explicitly surface divergence (keywords: divergent/divergence/manual/cluster state); got diags=%+v", diags)
-	}
-}
-
 // --- Bug #2 (AWS): Read silently misses asymmetric drift ----------------
 
 // TestAWSReadResourceState_StepActionMissing_AsymmetricDriftSurfaced asserts
@@ -137,5 +105,41 @@ func TestAWSUpdate_TaskFails_StepActionUntouched(t *testing.T) {
 		t.Errorf("BUG: StepAction was updated to v=%q before Task-update-fail. "+
 			"Post-fix invariant requires StepAction at v=1 (untouched). "+
 			"FAILS on main until the Task-first reorder fix lands.", got)
+	}
+}
+
+// TestAWSDelete_TaskFails_StepActionStillAttempted locks the post-fix
+// behavior for Delete orchestration on the AWS variant. When Task delete
+// fails (Forbidden, 5xx, etc.), the StepAction delete MUST still be
+// attempted — the helper uses best-effort + aggregated diagnostics. Combined
+// with the idempotent DeleteResource (NotFound -> nil), destroy retries
+// don't leave orphans.
+//
+// PASSES today on this branch after the deleteResources helper is in place.
+// FAILS on main because the lifecycle Delete early-returns on Task-fail.
+func TestAWSDelete_TaskFails_StepActionStillAttempted(t *testing.T) {
+	task := testfake.Task(tektonPipelinesNamespace, awsTaskName, nil)
+	sa := testfake.StepAction(tektonPipelinesNamespace, awsStepActionName, nil)
+	r, c := awsResourceWithFake(task, sa)
+
+	// Inject Forbidden on Task delete only — StepAction delete is left
+	// free to proceed.
+	testfake.WithError(c, "delete", testfake.TaskGVR, testfake.ErrForbidden(testfake.TaskGVR, awsTaskName))
+
+	ops := tekton.NewResourceOperations(c)
+	diags := r.deleteResources(context.Background(), ops, tektonPipelinesNamespace, awsTaskName, awsStepActionName)
+
+	if !diags.HasError() {
+		t.Fatal("expected Task-delete Forbidden error to surface")
+	}
+
+	// Task must STILL be in cluster (its delete failed).
+	if _, err := c.Resource(testfake.TaskGVR).Namespace(tektonPipelinesNamespace).Get(context.Background(), awsTaskName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected Task still in cluster (its delete failed), got err=%v", err)
+	}
+
+	// StepAction must be GONE (its delete was still attempted and succeeded).
+	if _, err := c.Resource(testfake.StepActionGVR).Namespace(tektonPipelinesNamespace).Get(context.Background(), awsStepActionName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected StepAction deleted (best-effort), got err=%v", err)
 	}
 }

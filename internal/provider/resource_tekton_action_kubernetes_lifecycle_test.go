@@ -2,12 +2,10 @@ package provider
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton/testfake"
-	"github.com/hashicorp/terraform-plugin-framework/diag"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -16,21 +14,6 @@ import (
 // and the asymmetric-drift Read case (issue #9 / Bug #2 narrow framing) on
 // the Kubernetes Tekton Action resource. Each test asserts the POST-FIX
 // behavior so it FAILS on `main` and PASSES once the corresponding fix lands.
-
-// diagsContainKeyword reports whether any diagnostic in diags has a Summary
-// or Detail that contains the given keyword (case-insensitive). Used by the
-// Bug #4 divergence assertion to require explicit divergence-keyword
-// surfacing in post-fix diagnostics.
-func diagsContainKeyword(diags diag.Diagnostics, keyword string) bool {
-	needle := strings.ToLower(keyword)
-	for _, d := range diags {
-		hay := strings.ToLower(d.Summary() + " " + d.Detail())
-		if strings.Contains(hay, needle) {
-			return true
-		}
-	}
-	return false
-}
 
 const (
 	k8sTaskName       = "k8s-task-1"
@@ -97,45 +80,6 @@ func TestK8sCreate_StepActionFails_NoOrphan(t *testing.T) {
 }
 
 // --- Bug #4: Update divergence on Task fail -----------------------------
-
-// TestK8sUpdate_TaskFails_SurfacesDivergenceDiagnostic asserts the POST-FIX
-// behavior for Bug #4 / issue #10. When Task update fails after StepAction
-// update succeeded, the surfaced diagnostics must explicitly mention the
-// divergence (e.g. via keywords like "divergent", "manual", or "cluster
-// state") — not just the underlying Task-update error.
-//
-// FAILS on `main` because today the only diagnostic is a generic
-// "Error updating Task" message with no divergence keyword. Passes once
-// issue #10 fix enriches the diagnostic (or adds a second one).
-func TestK8sUpdate_TaskFails_SurfacesDivergenceDiagnostic(t *testing.T) {
-	// Seed cluster with old objects (label v: "1").
-	oldTask := testfake.Task(k8sReadTestNamespace, k8sTaskName, map[string]string{"v": "1"})
-	oldSA := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, map[string]string{"v": "1"})
-	r, c := resourceWithFake(oldTask, oldSA)
-
-	// Inject error on Task update only — StepAction update will succeed.
-	testfake.WithError(c, "update", testfake.TaskGVR, testfake.ErrInternalServer("etcd unavailable"))
-
-	// New objects with label v: "2".
-	newSA := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, map[string]string{"v": "2"})
-	newTask := testfake.Task(k8sReadTestNamespace, k8sTaskName, map[string]string{"v": "2"})
-	ops := tekton.NewResourceOperations(c)
-
-	diags := r.updateResources(context.Background(), ops, newSA, newTask)
-	if !diags.HasError() {
-		t.Fatal("expected Task-update error to surface")
-	}
-
-	// Post-fix: at least one diagnostic must explicitly call out the
-	// divergence (keyword check across all diagnostic summaries+details).
-	hasDivergenceKeyword := diagsContainKeyword(diags, "divergent") ||
-		diagsContainKeyword(diags, "divergence") ||
-		diagsContainKeyword(diags, "manual") ||
-		diagsContainKeyword(diags, "cluster state")
-	if !hasDivergenceKeyword {
-		t.Errorf("expected diagnostics to explicitly surface divergence (keywords: divergent/divergence/manual/cluster state); got diags=%+v", diags)
-	}
-}
 
 // --- Bug #2: Read silently misses asymmetric drift ----------------------
 
@@ -241,5 +185,41 @@ func TestK8sCreate_TaskFailsAndRollbackFails_BothDiagnosticsSurface(t *testing.T
 	if _, err := c.Resource(testfake.StepActionGVR).Namespace(k8sReadTestNamespace).Get(context.Background(), k8sStepActionName, metav1.GetOptions{}); err != nil {
 		t.Errorf("expected orphan StepAction (rollback failed), got err=%v. "+
 			"If this test fails, the rollback-failure path may have changed.", err)
+	}
+}
+
+// TestK8sDelete_TaskFails_StepActionStillAttempted locks the post-fix
+// behavior for Delete orchestration. When Task delete fails (Forbidden,
+// 5xx, etc.), the StepAction delete MUST still be attempted — the helper
+// uses best-effort + aggregated diagnostics. Combined with the idempotent
+// DeleteResource (NotFound -> nil), this means destroy retries don't leave
+// orphans.
+//
+// PASSES today on this branch after the deleteResources helper is in place.
+// FAILS on main because the lifecycle Delete early-returns on Task-fail.
+func TestK8sDelete_TaskFails_StepActionStillAttempted(t *testing.T) {
+	task := testfake.Task(k8sReadTestNamespace, k8sTaskName, nil)
+	sa := testfake.StepAction(k8sReadTestNamespace, k8sStepActionName, nil)
+	r, c := resourceWithFake(task, sa)
+
+	// Inject Forbidden on Task delete only — StepAction delete is left
+	// free to proceed.
+	testfake.WithError(c, "delete", testfake.TaskGVR, testfake.ErrForbidden(testfake.TaskGVR, k8sTaskName))
+
+	ops := tekton.NewResourceOperations(c)
+	diags := r.deleteResources(context.Background(), ops, k8sReadTestNamespace, k8sTaskName, k8sStepActionName)
+
+	if !diags.HasError() {
+		t.Fatal("expected Task-delete Forbidden error to surface")
+	}
+
+	// Task must STILL be in cluster (its delete failed).
+	if _, err := c.Resource(testfake.TaskGVR).Namespace(k8sReadTestNamespace).Get(context.Background(), k8sTaskName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected Task still in cluster (its delete failed), got err=%v", err)
+	}
+
+	// StepAction must be GONE (its delete was still attempted and succeeded).
+	if _, err := c.Resource(testfake.StepActionGVR).Namespace(k8sReadTestNamespace).Get(context.Background(), k8sStepActionName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected StepAction deleted (best-effort), got err=%v", err)
 	}
 }

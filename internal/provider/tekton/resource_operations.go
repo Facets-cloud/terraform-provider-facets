@@ -21,16 +21,39 @@ func NewResourceOperations(client dynamic.Interface) *ResourceOperations {
 	return &ResourceOperations{client: client}
 }
 
-// CreateResource creates a Kubernetes resource
+// CreateResource creates a Kubernetes resource. If the object already exists
+// (AlreadyExists error), it adopts the existing cluster object by updating it
+// in-place with the new spec. This handles two cases safely:
+//
+//  1. A prior apply's rollback failed, leaving an orphaned object in cluster.
+//  2. The deterministic-hash name collides — a collision IS the same logical
+//     resource, so updating it is correct.
+//
+// Combined with idempotent DeleteResource, this means apply retries are fully
+// safe and will never get stuck on stale cluster objects.
 func (r *ResourceOperations) CreateResource(ctx context.Context, obj *unstructured.Unstructured, group, version, resource string) error {
 	gvr := k8sschema.GroupVersionResource{
 		Group:    group,
 		Version:  version,
 		Resource: resource,
 	}
-
 	namespace := obj.GetNamespace()
 	_, err := r.client.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !k8serrors.IsAlreadyExists(err) {
+		return err
+	}
+	// Adopt: a prior attempt's rollback may have failed, or the deterministic-
+	// hash name collided. Update in place to bring the existing object to the
+	// desired spec.
+	current, getErr := r.client.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
+	if getErr != nil {
+		return getErr
+	}
+	obj.SetResourceVersion(current.GetResourceVersion())
+	_, err = r.client.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	return err
 }
 
