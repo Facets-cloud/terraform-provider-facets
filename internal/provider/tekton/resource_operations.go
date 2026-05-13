@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -60,7 +61,8 @@ func (r *ResourceOperations) UpdateResource(ctx context.Context, obj *unstructur
 	return err
 }
 
-// DeleteResource deletes a Kubernetes resource
+// DeleteResource deletes a Kubernetes resource. The operation is idempotent:
+// a NotFound error from the API is treated as a no-op and nil is returned.
 func (r *ResourceOperations) DeleteResource(ctx context.Context, namespace, name, group, version, resource string) error {
 	gvr := k8sschema.GroupVersionResource{
 		Group:    group,
@@ -68,7 +70,11 @@ func (r *ResourceOperations) DeleteResource(ctx context.Context, namespace, name
 		Resource: resource,
 	}
 
-	return r.client.Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err := r.client.Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && k8serrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // GetResource retrieves a Kubernetes resource
