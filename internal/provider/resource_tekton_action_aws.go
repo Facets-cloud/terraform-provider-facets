@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -426,22 +427,69 @@ func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadReq
 }
 
 // readResourceState performs the cluster-side existence check for the AWS
-// Tekton Action resource. Mirrors the K8s variant's helper. See
-// resource_tekton_action_kubernetes.go:readResourceState for the bug
-// description (issue #9) — the AWS variant has bug-for-bug identical
-// behavior and will receive the same fix.
+// Tekton Action resource. Mirrors the K8s variant's helper.
+//
+// Fix for issue #9: classifies errors via apierrors.IsNotFound so that only
+// genuine NotFound responses trigger state removal. Transient errors (5xx,
+// RBAC, timeout, context cancellation) surface as diagnostics and retain
+// state. Both Task and StepAction are checked; asymmetric in-cluster drift
+// (one present, one missing) surfaces a warning and retains state.
+//
+// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
+// (the AWS model has no Namespace field).
 func (r *TektonActionAWSResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionAWSResourceModel) (removeFromState bool, diags diag.Diagnostics) {
-	gvr := k8sschema.GroupVersionResource{
-		Group:    "tekton.dev",
-		Version:  "v1beta1",
-		Resource: "tasks",
-	}
-	_, err := client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	taskGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
+	stepActionGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "stepactions"}
+
+	taskExists := true
+	_, err := client.Resource(taskGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
-		// BUG #9: treats every error as deletion. See K8s variant for full doc.
-		return true, nil
+		if apierrors.IsNotFound(err) {
+			taskExists = false
+		} else {
+			diags.AddError(
+				"Error reading Task",
+				fmt.Sprintf("Could not read Task %s/%s: %s", tektonPipelinesNamespace, state.TaskName.ValueString(), err.Error()),
+			)
+			return false, diags
+		}
 	}
-	return false, nil
+
+	stepActionExists := true
+	_, err = client.Resource(stepActionGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			stepActionExists = false
+		} else {
+			diags.AddError(
+				"Error reading StepAction",
+				fmt.Sprintf("Could not read StepAction %s/%s: %s", tektonPipelinesNamespace, state.StepActionName.ValueString(), err.Error()),
+			)
+			return false, diags
+		}
+	}
+
+	switch {
+	case !taskExists && !stepActionExists:
+		// Both genuinely deleted — clean removal from state.
+		return true, diags
+	case taskExists != stepActionExists:
+		// Asymmetric drift — refuse to silently mutate state.
+		diags.AddWarning(
+			"Tekton resource cluster drift detected",
+			fmt.Sprintf(
+				"Asymmetric cluster state for resource %s: Task exists=%v, StepAction exists=%v. "+
+					"This typically means a prior partial create or out-of-band cluster cleanup. "+
+					"Resolve by either (a) deleting the surviving cluster object and re-applying, "+
+					"or (b) running `terraform import` to bring the missing piece back into state.",
+				state.ID.ValueString(), taskExists, stepActionExists,
+			),
+		)
+		return false, diags
+	default:
+		// Both present and healthy.
+		return false, diags
+	}
 }
 
 func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
