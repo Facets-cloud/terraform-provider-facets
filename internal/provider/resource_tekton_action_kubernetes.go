@@ -8,6 +8,7 @@ import (
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -26,11 +27,19 @@ var (
 )
 
 func NewTektonActionKubernetesResource() resource.Resource {
-	return &TektonActionKubernetesResource{}
+	return &TektonActionKubernetesResource{
+		clientFactory: k8s.GetKubernetesClient,
+	}
 }
 
 type TektonActionKubernetesResource struct {
-	// No cached client - fresh client created per operation for thread safety
+	// No cached client - fresh client created per operation for thread safety.
+	//
+	// clientFactory produces a Kubernetes dynamic client. Defaults to
+	// k8s.GetKubernetesClient in production via NewTektonActionKubernetesResource.
+	// Tests in the same package may override this field directly to inject a
+	// fake client. Do not access from outside the provider package.
+	clientFactory func() (dynamic.Interface, error)
 }
 
 type TektonActionKubernetesResourceModel struct {
@@ -239,8 +248,19 @@ func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req reso
 // getClient returns a fresh Kubernetes client and operations for each call.
 // This pattern matches terraform-provider-helm best practices - no cached state,
 // thread-safe, and avoids stale client issues.
+//
+// In production, clientFactory is k8s.GetKubernetesClient (set by
+// NewTektonActionKubernetesResource). In tests, the field can be overridden
+// to inject a fake dynamic.Interface for unit-testing CRUD lifecycle paths.
 func (r *TektonActionKubernetesResource) getClient() (dynamic.Interface, *tekton.ResourceOperations, error) {
-	client, err := k8s.GetKubernetesClient()
+	factory := r.clientFactory
+	if factory == nil {
+		// Safety net: a zero-valued struct (e.g. constructed without
+		// NewTektonActionKubernetesResource) still produces a real client
+		// rather than panicking with a nil-pointer dereference.
+		factory = k8s.GetKubernetesClient
+	}
+	client, err := factory()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
@@ -313,35 +333,53 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		customLabels,
 	)
 
-	// Create StepAction
+	// Build StepAction
 	stepAction := tekton.BuildKubernetesStepAction(
 		plan.StepActionName.ValueString(),
 		plan.Namespace.ValueString(),
 		metadata.LabelsAsInterface(),
 	)
-	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error creating StepAction",
-			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
-		)
-		return
-	}
 
-	// Create Task
+	// Build Task
 	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error creating Task",
-			fmt.Sprintf("Could not create Task: %s", err.Error()),
-		)
+	resp.Diagnostics.Append(r.createResources(ctx, operations, stepAction, task)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// createResources creates the StepAction and Task in cluster. Returns
+// diagnostics. Extracted from Create so unit tests can exercise the
+// orphan-on-Task-fail path with a fake dynamic client.
+//
+// CURRENT BUG (issue #10 / Bug #1): if Task creation fails after StepAction
+// creation succeeded, no rollback is performed — the StepAction remains in
+// cluster permanently as an orphan. The fix in #10 will roll back the
+// StepAction here.
+func (r *TektonActionKubernetesResource) createResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+		diags.AddError(
+			"Error creating StepAction",
+			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
+		)
+		return diags
+	}
+	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+		diags.AddError(
+			"Error creating Task",
+			fmt.Sprintf("Could not create Task: %s", err.Error()),
+		)
+		// BUG #1: StepAction created above is left in cluster as orphan.
+		return diags
+	}
+	return diags
 }
 
 func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -362,20 +400,45 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 		return
 	}
 
-	// Verify Task exists
-	gvr := k8sschema.GroupVersionResource{
-		Group:    "tekton.dev",
-		Version:  "v1beta1",
-		Resource: "tasks",
+	remove, diags := r.readResourceState(ctx, client, state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
-
-	_, err = client.Resource(gvr).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
-	if err != nil {
+	if remove {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// readResourceState performs the cluster-side existence check for the Tekton
+// Action resource. Returns whether Read should clear state from the response,
+// and any diagnostics to surface to the operator.
+//
+// Extracted from Read to enable unit testing against a fake dynamic.Interface
+// without constructing tfsdk.State / tfsdk.ReadRequest plumbing.
+//
+// CURRENT BUG (issue #9): any error from the Task Get — including transient
+// failures (5xx, RBAC, timeout, context cancellation) — causes
+// removeFromState to be true, silently wiping state on a healthy resource.
+// The fix in issue #9 will classify errors via k8serrors.IsNotFound and also
+// check the StepAction so asymmetric drift is surfaced. The signature of this
+// helper is stable across that change so tests can flip assertions without
+// rewriting their setup.
+func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionKubernetesResourceModel) (removeFromState bool, diags diag.Diagnostics) {
+	gvr := k8sschema.GroupVersionResource{
+		Group:    "tekton.dev",
+		Version:  "v1beta1",
+		Resource: "tasks",
+	}
+	_, err := client.Resource(gvr).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	if err != nil {
+		// BUG #9: treats every error as deletion. See doc comment.
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -438,31 +501,48 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		customLabels,
 	)
 
-	// Update StepAction
+	// Build StepAction and Task
 	stepAction := tekton.BuildKubernetesStepAction(
 		plan.StepActionName.ValueString(),
 		plan.Namespace.ValueString(),
 		metadata.LabelsAsInterface(),
 	)
-	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error updating StepAction",
-			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
-		)
-		return
-	}
-
-	// Update Task
 	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
-	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error updating Task",
-			fmt.Sprintf("Could not update Task: %s", err.Error()),
-		)
+
+	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// updateResources updates the StepAction and Task in cluster. Returns
+// diagnostics. Extracted from Update so unit tests can exercise the
+// divergence-on-Task-fail path with a fake dynamic client.
+//
+// CURRENT BUG (issue #10 / Bug #4): if Task update fails after StepAction
+// update succeeded, the in-cluster StepAction has new content but the Task
+// has old content — divergent silently. The fix in #10 will surface a loud
+// diagnostic (or attempt snapshot-restore) here.
+func (r *TektonActionKubernetesResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+		diags.AddError(
+			"Error updating StepAction",
+			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
+		)
+		return diags
+	}
+	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+		diags.AddError(
+			"Error updating Task",
+			fmt.Sprintf("Could not update Task: %s", err.Error()),
+		)
+		// BUG #4: StepAction updated above remains divergent from old Task.
+		return diags
+	}
+	return diags
 }
 
 func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
