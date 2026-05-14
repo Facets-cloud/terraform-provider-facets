@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-05-14
+
+### Fixed
+- **`facets_tekton_action_kubernetes` / `facets_tekton_action_aws` lifecycle hardening** (closes #9, #10, #11)
+  - **Delete is now idempotent on NotFound** — `terraform destroy` succeeds when the Task or StepAction has already been removed out-of-band (e.g. manual cluster cleanup mid-incident). NotFound is treated as already-deleted; all other error classes (Forbidden, ServerTimeout, InternalServer, etc.) still propagate.
+  - **Delete orchestration is best-effort** — if Task delete fails, StepAction delete is still attempted. Both errors aggregate into diagnostics. Combined with NotFound-idempotency, destroy retries are safe end-to-end and no longer leave orphan StepActions.
+  - **Read classifies errors via `apierrors.IsNotFound`** — only genuine NotFound responses trigger state removal. Transient apiserver failures (503, 403, ServerTimeout, context cancellation) now surface as diagnostics with state retained, eliminating the silent state-corruption pathway during apiserver outages.
+  - **Read detects asymmetric cluster drift** — both Task and StepAction are checked. If exactly one exists, a warning surfaces explaining the asymmetric state and the recovery paths (re-apply after deleting the surviving object, or `terraform import`).
+  - **Create rollback on partial failure** — if Task creation fails after StepAction creation succeeded, the StepAction is rolled back. If the rollback itself fails, the next apply self-heals: `CreateResource` adopts existing cluster objects via Get-then-Update (safe because the resource name is a deterministic hash of identity inputs).
+  - **Update is Task-first** — if Task update fails, StepAction is never touched and the cluster remains in a coherent pre-Update state (zero divergence). If Task succeeds but StepAction fails, the cluster stays functional because the Task references the StepAction by its immutable `ref.name`; operator re-runs apply to retry the StepAction update only.
+
+### Added
+- **Fake-client test harness** at `internal/provider/tekton/testfake/` — a `client-go/dynamic/fake`-backed harness with reactor-based error injection and canonical Task/StepAction fixtures, enabling unit tests of CRUD lifecycle behavior against synthetic apiserver failures without a real cluster.
+- 56 unit tests covering each fix as a regression guard (NotFound idempotency, error-class classification, asymmetric drift, Create rollback + AlreadyExists adopt, Task-first Update invariant, Delete orchestration).
+
+### Customer Impact
+Closes the recurring "orphan StepAction on disable/enable cycle" failure mode reported by customers running the AWS variant (MoveInSync, CommerceIQ). The Read + Create + Update + Delete fixes eliminate every known pathway by which Tekton resources accumulated as orphans in customer clusters during transient apiserver issues.
+
+### Technical Details
+No schema changes. No breaking changes. Diagnostics for partial-failure paths (asymmetric drift, Update divergence) are surfaced as warnings/errors; CI pipelines that gate purely on `terraform apply` exit code will not block on asymmetric-drift warnings — inspect plan output if you need to fail on drift.
+
 ## [1.2.0] - 2026-02-02
 
 ### Changed
