@@ -10,11 +10,13 @@ import (
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,13 +33,21 @@ var (
 
 // NewTektonActionAWSResource creates a new AWS action resource
 func NewTektonActionAWSResource() resource.Resource {
-	return &TektonActionAWSResource{}
+	return &TektonActionAWSResource{
+		clientFactory: k8s.GetKubernetesClient,
+	}
 }
 
 // TektonActionAWSResource manages Tekton Tasks and StepActions for AWS workflows
 type TektonActionAWSResource struct {
 	providerData *FacetsProviderModel
-	// No cached client - fresh client created per operation for thread safety
+	// No cached client - fresh client created per operation for thread safety.
+	//
+	// clientFactory produces a Kubernetes dynamic client. Defaults to
+	// k8s.GetKubernetesClient in production via NewTektonActionAWSResource.
+	// Tests in the same package may override this field directly to inject a
+	// fake client. Do not access from outside the provider package.
+	clientFactory func() (dynamic.Interface, error)
 }
 
 // TektonActionAWSResourceModel represents the resource data model
@@ -242,8 +252,19 @@ func (r *TektonActionAWSResource) Configure(ctx context.Context, req resource.Co
 // getClient returns a fresh Kubernetes client and operations for each call.
 // This pattern matches terraform-provider-helm best practices - no cached state,
 // thread-safe, and avoids stale client issues.
+//
+// In production, clientFactory is k8s.GetKubernetesClient (set by
+// NewTektonActionAWSResource). In tests, the field can be overridden to
+// inject a fake dynamic.Interface for unit-testing CRUD lifecycle paths.
 func (r *TektonActionAWSResource) getClient() (dynamic.Interface, *tekton.ResourceOperations, error) {
-	client, err := k8s.GetKubernetesClient()
+	factory := r.clientFactory
+	if factory == nil {
+		// Safety net: a zero-valued struct (e.g. constructed without
+		// NewTektonActionAWSResource) still produces a real client rather
+		// than panicking with a nil-pointer dereference.
+		factory = k8s.GetKubernetesClient
+	}
+	client, err := factory()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
@@ -338,29 +359,59 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		)
 		return
 	}
-	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error creating StepAction",
-			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
-		)
-		return
-	}
-
-	// Create Task
+	// Build Task
 	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error creating Task",
-			fmt.Sprintf("Could not create Task: %s", err.Error()),
-		)
+	resp.Diagnostics.Append(r.createResources(ctx, operations, stepAction, task)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// createResources creates the StepAction and Task in cluster. Mirrors the K8s variant.
+//
+// Fix for issue #10 / Bug #1: if Task creation fails after StepAction creation
+// succeeded, the StepAction is rolled back via DeleteResource (idempotent on
+// NotFound per fix #11). If rollback itself fails, a warning is surfaced
+// alongside the original Task-create error so the operator knows manual
+// cleanup may be required.
+func (r *TektonActionAWSResource) createResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+		diags.AddError(
+			"Error creating StepAction",
+			fmt.Sprintf("Could not create StepAction: %s", err.Error()),
+		)
+		return diags
+	}
+	if err := operations.CreateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+		// Roll back the StepAction we just created so it doesn't orphan in cluster.
+		// DeleteResource is idempotent on NotFound (per fix #11), so this is safe
+		// even if the StepAction is somehow already gone.
+		if rollbackErr := operations.DeleteResource(
+			ctx,
+			stepAction.GetNamespace(),
+			stepAction.GetName(),
+			"tekton.dev", "v1beta1", "stepactions",
+		); rollbackErr != nil {
+			diags.AddWarning(
+				"Rollback of orphaned StepAction failed",
+				fmt.Sprintf("Task creation failed; could not clean up StepAction %s/%s: %s. Manual cleanup may be required.",
+					stepAction.GetNamespace(), stepAction.GetName(), rollbackErr.Error()),
+			)
+		}
+		diags.AddError(
+			"Error creating Task",
+			fmt.Sprintf("Could not create Task: %s", err.Error()),
+		)
+		return diags
+	}
+	return diags
 }
 
 func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -381,20 +432,83 @@ func (r *TektonActionAWSResource) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
-	// Verify Task exists
-	gvr := k8sschema.GroupVersionResource{
-		Group:    "tekton.dev",
-		Version:  "v1beta1",
-		Resource: "tasks",
+	remove, diags := r.readResourceState(ctx, client, state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
-
-	_, err = client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
-	if err != nil {
+	if remove {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// readResourceState performs the cluster-side existence check for the AWS
+// Tekton Action resource. Mirrors the K8s variant's helper.
+//
+// Fix for issue #9: classifies errors via apierrors.IsNotFound so that only
+// genuine NotFound responses trigger state removal. Transient errors (5xx,
+// RBAC, timeout, context cancellation) surface as diagnostics and retain
+// state. Both Task and StepAction are checked; asymmetric in-cluster drift
+// (one present, one missing) surfaces a warning and retains state.
+//
+// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
+// (the AWS model has no Namespace field).
+func (r *TektonActionAWSResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionAWSResourceModel) (removeFromState bool, diags diag.Diagnostics) {
+	taskGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
+	stepActionGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "stepactions"}
+
+	taskExists := true
+	_, err := client.Resource(taskGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			taskExists = false
+		} else {
+			diags.AddError(
+				"Error reading Task",
+				fmt.Sprintf("Could not read Task %s/%s: %s", tektonPipelinesNamespace, state.TaskName.ValueString(), err.Error()),
+			)
+			return false, diags
+		}
+	}
+
+	stepActionExists := true
+	_, err = client.Resource(stepActionGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			stepActionExists = false
+		} else {
+			diags.AddError(
+				"Error reading StepAction",
+				fmt.Sprintf("Could not read StepAction %s/%s: %s", tektonPipelinesNamespace, state.StepActionName.ValueString(), err.Error()),
+			)
+			return false, diags
+		}
+	}
+
+	switch {
+	case !taskExists && !stepActionExists:
+		// Both genuinely deleted — clean removal from state.
+		return true, diags
+	case taskExists != stepActionExists:
+		// Asymmetric drift — refuse to silently mutate state.
+		diags.AddWarning(
+			"Tekton resource cluster drift detected",
+			fmt.Sprintf(
+				"Asymmetric cluster state for resource %s: Task exists=%v, StepAction exists=%v. "+
+					"This typically means a prior partial create or out-of-band cluster cleanup. "+
+					"Resolve by either (a) deleting the surviving cluster object and re-applying, "+
+					"or (b) running `terraform import` to bring the missing piece back into state.",
+				state.ID.ValueString(), taskExists, stepActionExists,
+			),
+		)
+		return false, diags
+	default:
+		// Both present and healthy.
+		return false, diags
+	}
 }
 
 func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -483,25 +597,50 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		)
 		return
 	}
-	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error updating StepAction",
-			fmt.Sprintf("Could not update StepAction: %s", err.Error()),
-		)
-		return
-	}
-
-	// Update Task
+	// Build Task
 	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
-	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error updating Task",
-			fmt.Sprintf("Could not update Task: %s", err.Error()),
-		)
+
+	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// updateResources updates the Task and StepAction in cluster. Mirrors the K8s variant.
+//
+// Task-first ordering rationale: updating Task before StepAction ensures that
+// if Task update fails (validation, RBAC, webhook), the StepAction is never
+// touched and the cluster remains in a coherent pre-Update state — zero
+// divergence. If Task succeeds but StepAction fails, the cluster is still
+// functional because the Task references the StepAction by immutable ref.name;
+// the old StepAction spec still resolves. The operator re-runs to retry the
+// StepAction update only.
+func (r *TektonActionAWSResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+	var diags diag.Diagnostics
+	// Update Task FIRST. If it fails (validation, RBAC, webhook), the StepAction
+	// is never touched and the cluster remains in a coherent pre-Update state.
+	if err := operations.UpdateResource(ctx, task, "tekton.dev", "v1beta1", "tasks"); err != nil {
+		diags.AddError(
+			"Error updating Task",
+			fmt.Sprintf("Could not update Task: %s", err.Error()),
+		)
+		return diags
+	}
+	// Task already updated. If StepAction update fails the cluster is still
+	// functional — the Task references the StepAction by immutable ref.name,
+	// and the StepAction at its old spec still resolves. Operator re-runs to
+	// retry the StepAction update.
+	if err := operations.UpdateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
+		diags.AddError(
+			"Error updating StepAction",
+			fmt.Sprintf("Task updated successfully but StepAction update failed: %s. "+
+				"Re-run terraform apply to retry the StepAction update.", err.Error()),
+		)
+		return diags
+	}
+	return diags
 }
 
 func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -522,23 +661,34 @@ func (r *TektonActionAWSResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	// Delete Task
-	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.TaskName.ValueString(), "tekton.dev", "v1beta1", "tasks"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error deleting Task",
-			fmt.Sprintf("Could not delete Task: %s", err.Error()),
-		)
-		return
-	}
+	resp.Diagnostics.Append(r.deleteResources(ctx, operations, tektonPipelinesNamespace, state.TaskName.ValueString(), state.StepActionName.ValueString())...)
+}
 
-	// Delete StepAction
-	if err := operations.DeleteResource(ctx, tektonPipelinesNamespace, state.StepActionName.ValueString(), "tekton.dev", "v1beta1", "stepactions"); err != nil {
-		resp.Diagnostics.AddError(
-			"Error deleting StepAction",
-			fmt.Sprintf("Could not delete StepAction: %s", err.Error()),
+// deleteResources attempts to delete both the Task and the StepAction, using
+// best-effort semantics — if one fails, the other is still attempted, and both
+// errors are aggregated into the returned diagnostics. Combined with the
+// idempotent DeleteResource (which treats NotFound as success), this means
+// destroy retries are safe.
+//
+// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
+// (the AWS model has no Namespace field).
+func (r *TektonActionAWSResource) deleteResources(ctx context.Context, operations *tekton.ResourceOperations, namespace, taskName, stepActionName string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	taskErr := operations.DeleteResource(ctx, namespace, taskName, "tekton.dev", "v1beta1", "tasks")
+	stepActionErr := operations.DeleteResource(ctx, namespace, stepActionName, "tekton.dev", "v1beta1", "stepactions")
+	if taskErr != nil {
+		diags.AddError(
+			"Error deleting Task",
+			fmt.Sprintf("Could not delete Task: %s", taskErr.Error()),
 		)
-		return
 	}
+	if stepActionErr != nil {
+		diags.AddError(
+			"Error deleting StepAction",
+			fmt.Sprintf("Could not delete StepAction: %s", stepActionErr.Error()),
+		)
+	}
+	return diags
 }
 
 func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
