@@ -140,6 +140,60 @@ provider "facets" {
 
 For detailed documentation, examples, and authentication methods, see [facets_tekton_action_aws](docs/resources/tekton_action_aws.md).
 
+---
+
+### `facets_tekton_action_azure`
+
+Creates a Tekton Task and StepAction for Azure-based workflows with automatic credential management. The generated `setup-credentials` step runs `az login` and writes the token cache to `/workspace/.azure`, so user steps call `az` without handling credentials.
+
+#### Provider Configuration
+
+Configure Azure credentials in the provider block. Exactly one authentication method must be set.
+
+**Workload Identity (recommended — no stored secret):**
+```hcl
+provider "facets" {
+  azure = {
+    subscription_id       = "00000000-0000-0000-0000-000000000000"
+    tenant_id             = "11111111-1111-1111-1111-111111111111"
+    client_id             = "22222222-2222-2222-2222-222222222222"
+    use_workload_identity = true
+  }
+}
+```
+
+**Client secret from an existing Kubernetes Secret:**
+```hcl
+provider "facets" {
+  azure = {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    tenant_id       = "11111111-1111-1111-1111-111111111111"
+    client_id       = "22222222-2222-2222-2222-222222222222"
+
+    client_secret_ref = {
+      secret_name = "facets-azure-sp"
+      secret_key  = "client-secret" # optional, this is the default
+    }
+  }
+}
+```
+
+There is no inline client-secret argument by design — the password would otherwise be written in plaintext into both Terraform state and the StepAction object in-cluster.
+
+#### Schema
+
+Identical to `facets_tekton_action_aws`: `name`, `description`, `facets_resource_name`, `facets_environment`, `facets_resource`, `steps`, `params`.
+
+Steps receive `AZURE_CONFIG_DIR`, `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`. `AZURE_CLIENT_SECRET` is scoped to the setup step and is not propagated.
+
+#### Computed Attributes
+
+- `id` (String): Resource identifier
+- `task_name` (String): Generated Tekton Task name
+- `step_action_name` (String): Generated StepAction name for Azure credential setup
+
+For detailed documentation, examples, and authentication methods, see [facets_tekton_action_azure](docs/resources/tekton_action_azure.md).
+
 ## Installation
 
 See [INSTALL.md](INSTALL.md) for detailed installation instructions.

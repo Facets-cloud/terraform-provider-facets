@@ -17,7 +17,8 @@ type FacetsProvider struct {
 }
 
 type FacetsProviderModel struct {
-	AWS types.Object `tfsdk:"aws"`
+	AWS   types.Object `tfsdk:"aws"`
+	Azure types.Object `tfsdk:"azure"`
 }
 
 type ProviderAWSConfig struct {
@@ -29,6 +30,20 @@ type ProviderAWSAssumeRoleConfig struct {
 	RoleARN     types.String `tfsdk:"role_arn"`
 	ExternalID  types.String `tfsdk:"external_id"`
 	SessionName types.String `tfsdk:"session_name"`
+}
+
+type ProviderAzureConfig struct {
+	SubscriptionID      types.String `tfsdk:"subscription_id"`
+	TenantID            types.String `tfsdk:"tenant_id"`
+	ClientID            types.String `tfsdk:"client_id"`
+	UseWorkloadIdentity types.Bool   `tfsdk:"use_workload_identity"`
+	ClientSecretRef     types.Object `tfsdk:"client_secret_ref"`
+	Environment         types.String `tfsdk:"environment"`
+}
+
+type ProviderAzureClientSecretRefConfig struct {
+	SecretName types.String `tfsdk:"secret_name"`
+	SecretKey  types.String `tfsdk:"secret_key"`
 }
 
 func (p *FacetsProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -79,6 +94,59 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 					},
 				},
 			},
+			"azure": schema.SingleNestedAttribute{
+				Description: "Azure configuration for facets_tekton_action_azure resources. " +
+					"This block is optional and only required when using Azure actions. " +
+					"Authenticates as an Azure AD service principal, either via workload identity " +
+					"(federated credentials, no stored secret — the Azure analogue of IRSA) or via a " +
+					"client secret held in an existing Kubernetes Secret. Exactly one of " +
+					"use_workload_identity or client_secret_ref must be set.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"subscription_id": schema.StringAttribute{
+						Description: "Azure subscription ID the action operates against",
+						Required:    true,
+					},
+					"tenant_id": schema.StringAttribute{
+						Description: "Azure AD tenant ID",
+						Required:    true,
+					},
+					"client_id": schema.StringAttribute{
+						Description: "Application (client) ID of the service principal. For workload identity " +
+							"this must match the client ID on the federated credential.",
+						Required: true,
+					},
+					"environment": schema.StringAttribute{
+						Description: "Azure cloud environment: AzureCloud (default), AzureUSGovernment, or AzureChinaCloud",
+						Optional:    true,
+					},
+					"use_workload_identity": schema.BoolAttribute{
+						Description: "Authenticate using Azure Workload Identity federation. Preferred — no secret " +
+							"is stored anywhere. Requires the Workload Identity webhook in the cluster, a federated " +
+							"credential on the Azure AD application trusting the cluster's OIDC issuer and the " +
+							"tekton-pipelines service account, and the azure.workload.identity/use=true label on " +
+							"that service account. Mutually exclusive with client_secret_ref.",
+						Optional: true,
+					},
+					"client_secret_ref": schema.SingleNestedAttribute{
+						Description: "Reference to an existing Kubernetes Secret in the tekton-pipelines namespace " +
+							"holding the service principal password. The provider never reads the value — it emits a " +
+							"secretKeyRef, so the password stays out of Terraform state and out of the StepAction " +
+							"object. Mutually exclusive with use_workload_identity.",
+						Optional: true,
+						Attributes: map[string]schema.Attribute{
+							"secret_name": schema.StringAttribute{
+								Description: "Name of the Kubernetes Secret in the tekton-pipelines namespace",
+								Required:    true,
+							},
+							"secret_key": schema.StringAttribute{
+								Description: "Key within the Secret holding the password (default: client-secret)",
+								Optional:    true,
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -93,7 +161,7 @@ func (p *FacetsProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	}
 
 	// Store provider data for resource access
-	// AWS config validation happens in the resource's Configure() method
+	// AWS/Azure config validation happens in the resource's Configure() method
 	resp.ResourceData = &config
 }
 
@@ -101,6 +169,7 @@ func (p *FacetsProvider) Resources(ctx context.Context) []func() resource.Resour
 	return []func() resource.Resource{
 		NewTektonActionKubernetesResource,
 		NewTektonActionAWSResource,
+		NewTektonActionAzureResource,
 	}
 }
 

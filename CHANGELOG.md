@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **New Resource: `facets_tekton_action_azure`** for Azure workflow automation
+  - Prepends a `setup-credentials` StepAction that runs `az login` and writes the token cache to `/workspace/.azure`; user steps receive `AZURE_CONFIG_DIR`, `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` and call `az` without handling credentials
+  - Two mutually exclusive auth methods, validated at apply time:
+    - **Workload identity** (`use_workload_identity = true`) — federated credentials via the projected service account token. The Azure analogue of the AWS resource's IRSA-only stance; no secret is stored anywhere. Works on AKS and on any cluster with a reachable OIDC issuer.
+    - **Client secret reference** (`client_secret_ref`) — the SP password is read at pod start from an existing Kubernetes Secret via `secretKeyRef`. The provider never reads the value, so it stays out of Terraform state and out of the StepAction object.
+  - `cloud_action=true` label, so Azure actions are gated on `RUN_CLOUD_ACTION` rather than `RUN_ACTION`
+  - Full CRUD with the same lifecycle hardening as the AWS and Kubernetes variants (NotFound-idempotent delete, Create rollback on partial failure, Task-first update, asymmetric-drift warning on read) plus import support
+- **New provider config block: `azure`** with `subscription_id`, `tenant_id`, `client_id`, optional `environment` (AzureCloud / AzureUSGovernment / AzureChinaCloud), `use_workload_identity` and `client_secret_ref`
+- Documentation at `docs/resources/tekton_action_azure.md` and a worked example at `examples/azure/workload-identity/`
+- Unit tests for Azure config validation and StepAction generation, including a regression guard asserting the client secret is never materialised into the StepAction spec
+
+### Notes
+There is deliberately no inline client-secret argument. Passing the password through Terraform would write it in plaintext into both the state file and the cluster object; `client_secret_ref` exists so the value never transits Terraform at all.
+
+No changes to existing resources. No breaking changes.
+
 ## [1.2.1] - 2026-05-14
 
 ### Fixed
