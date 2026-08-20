@@ -138,8 +138,14 @@ func GenerateAzureLoginScript(config *azure.AzureAuthConfig) string {
 		// azure-cli image has az and jq but no aws. The credentials are written to
 		// the shared /workspace volume and consumed by the az login step that
 		// follows, then shredded.
+		// SECRET_ID was resolved at apply time (see azure.DeriveSecretManagerPath),
+		// so end users only ever supply a cloud account id -- they never need to
+		// know the control plane's internal secret layout. It is baked in here
+		// because the ACTION pod, unlike the release pod, has no TF_VAR_CP_NAME.
 		b.WriteString(fmt.Sprintf(`SECRET_ID=%q
 CREDS_FILE=%s/creds.json
+
+echo "Resolving credentials for cloud account %s"
 
 aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
   --query SecretString --output text > "$CREDS_FILE"
@@ -157,7 +163,7 @@ for k in clientId clientSecret tenantId subscriptionId; do
         exit 1
     fi
 done
-`, config.SecretManagerPath, AzureConfigDir))
+`, config.SecretManagerPath, AzureConfigDir, config.CloudAccountID))
 		return b.String()
 	}
 

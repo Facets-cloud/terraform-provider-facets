@@ -3,6 +3,7 @@ package azure
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
@@ -137,10 +138,27 @@ func GetAzureConfig(ctx context.Context, providerModel *ProviderModel) (*AzureAu
 			return nil, fmt.Errorf("cloud_account_id cannot be combined with client_secret or " +
 				"use_oidc_federation; pick exactly one authentication mode")
 		}
-		path := azureConfig.SecretManagerPath.ValueString()
-		if azureConfig.SecretManagerPath.IsNull() || path == "" {
-			return nil, fmt.Errorf("secret_manager_path is required alongside cloud_account_id " +
-				"(e.g. \"<cluster>/backend/accounts/<cloud_account_id>\")")
+		// secret_manager_path is optional and normally omitted: the action derives
+		// it in-pod from the control plane's own environment (TF_VAR_CP_NAME /
+		// TF_VAR_CP_CLOUD), exactly as cloudaccount-fetch-secret/secret-fetcher.py
+		// does. End users only ever supply a cloud account id, which they pick from
+		// a list -- they are not expected to know the control plane's internal
+		// secret layout. Set it explicitly only to override that convention.
+		path := ""
+		if !azureConfig.SecretManagerPath.IsNull() {
+			path = azureConfig.SecretManagerPath.ValueString()
+		}
+		if path == "" {
+			// Derive it here, at apply time, where the control plane's own
+			// environment is available. The ACTION pod does not carry
+			// TF_VAR_CP_NAME (only the release pod does), so this cannot be
+			// deferred to run time.
+			path = DeriveSecretManagerPath(cloudAccountID)
+			if path == "" {
+				return nil, fmt.Errorf("could not derive the credentials secret id: neither " +
+					"TF_VAR_CP_NAME nor CP_NAME is set in the release environment. " +
+					"Set secret_manager_path explicitly in the azure block to override")
+			}
 		}
 		return &AzureAuthConfig{
 			Mode:              AuthModeSecretManager,
@@ -197,4 +215,30 @@ func requiredString(v types.String, name string) (string, error) {
 		return "", fmt.Errorf("%s is required in the azure block of the provider configuration", name)
 	}
 	return v.ValueString(), nil
+}
+
+// DeriveSecretManagerPath builds the secret id holding a cloud account's
+// credentials, using the same convention as
+// cloudaccount-fetch-secret/secret-fetcher.py. It runs at apply time, in the
+// release environment, because the action pod itself has no TF_VAR_CP_NAME.
+//
+// Returns "" when the cluster name cannot be determined.
+func DeriveSecretManagerPath(cloudAccountID string) string {
+	cluster := firstNonEmptyEnv("TF_VAR_CP_NAME", "CP_NAME")
+	if cluster == "" || cloudAccountID == "" {
+		return ""
+	}
+	if cpCloud := firstNonEmptyEnv("TF_VAR_CP_CLOUD", "CP_CLOUD"); cpCloud == "gcp" {
+		return fmt.Sprintf("%s_backend_accounts_%s", cluster, cloudAccountID)
+	}
+	return fmt.Sprintf("%s/backend/accounts/%s", cluster, cloudAccountID)
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
 }

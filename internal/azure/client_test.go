@@ -201,6 +201,7 @@ func smModel(t *testing.T) *ProviderModel {
 
 // The whole point: no identity fields and no secret are required.
 func TestGetAzureConfig_SecretManagerMode(t *testing.T) {
+	t.Setenv("TF_VAR_CP_NAME", "my-cluster")
 	cfg, err := GetAzureConfig(context.Background(), smModel(t))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -219,16 +220,63 @@ func TestGetAzureConfig_SecretManagerMode(t *testing.T) {
 	}
 }
 
-func TestGetAzureConfig_SecretManager_RequiresPath(t *testing.T) {
+// End users supply only a cloud account id; the path is derived from the release
+// environment so they never need to know the internal secret layout.
+func TestGetAzureConfig_SecretManager_DerivesPath(t *testing.T) {
+	t.Setenv("TF_VAR_CP_NAME", "my-cluster")
 	m := newModel(t, map[string]attr.Value{
 		"cloud_account_id": types.StringValue("acct-123"),
 	})
-	_, err := GetAzureConfig(context.Background(), m)
-	if err == nil {
-		t.Fatal("expected an error when secret_manager_path is missing")
+	cfg, err := GetAzureConfig(context.Background(), m)
+	if err != nil {
+		t.Fatalf("cloud_account_id alone should be sufficient, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "secret_manager_path") {
-		t.Errorf("error should name secret_manager_path, got: %v", err)
+	if want := "my-cluster/backend/accounts/acct-123"; cfg.SecretManagerPath != want {
+		t.Errorf("derived path = %q, want %q", cfg.SecretManagerPath, want)
+	}
+}
+
+// GCP control planes use underscores rather than a path.
+func TestGetAzureConfig_SecretManager_DerivesGCPPath(t *testing.T) {
+	t.Setenv("TF_VAR_CP_NAME", "my-cluster")
+	t.Setenv("TF_VAR_CP_CLOUD", "gcp")
+	m := newModel(t, map[string]attr.Value{
+		"cloud_account_id": types.StringValue("acct-123"),
+	})
+	cfg, err := GetAzureConfig(context.Background(), m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "my-cluster_backend_accounts_acct-123"; cfg.SecretManagerPath != want {
+		t.Errorf("derived path = %q, want %q", cfg.SecretManagerPath, want)
+	}
+}
+
+// Failing loudly beats generating an action that cannot find its credentials.
+func TestGetAzureConfig_SecretManager_ErrorsWhenClusterUnknown(t *testing.T) {
+	t.Setenv("TF_VAR_CP_NAME", "")
+	t.Setenv("CP_NAME", "")
+	m := newModel(t, map[string]attr.Value{
+		"cloud_account_id": types.StringValue("acct-123"),
+	})
+	if _, err := GetAzureConfig(context.Background(), m); err == nil {
+		t.Fatal("expected an error when the cluster name cannot be determined")
+	}
+}
+
+// An explicit path bypasses derivation entirely.
+func TestGetAzureConfig_SecretManager_ExplicitPathWins(t *testing.T) {
+	t.Setenv("TF_VAR_CP_NAME", "my-cluster")
+	m := newModel(t, map[string]attr.Value{
+		"cloud_account_id":    types.StringValue("acct-123"),
+		"secret_manager_path": types.StringValue("custom/path"),
+	})
+	cfg, err := GetAzureConfig(context.Background(), m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SecretManagerPath != "custom/path" {
+		t.Errorf("explicit path not honoured, got %q", cfg.SecretManagerPath)
 	}
 }
 

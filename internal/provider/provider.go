@@ -106,13 +106,15 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 							"Task manifest, or in a Kubernetes Secret -- and no per-cluster setup is " +
 							"required. Mutually exclusive with client_secret and use_oidc_federation; " +
 							"when set, subscription_id / tenant_id / client_id are resolved at run time " +
-							"and need not be supplied. Requires secret_manager_path.",
+							"and need not be supplied.",
 						Optional: true,
 					},
 					"secret_manager_path": schema.StringAttribute{
-						Description: "Secret id holding the cloud account credentials, e.g. " +
-							"\"<cluster>/backend/accounts/<cloud_account_id>\". Required with " +
-							"cloud_account_id.",
+						Description: "OPTIONAL override for the secret id holding the cloud account " +
+							"credentials. Normally omit this: the action derives the id at run time from " +
+							"the control plane's own environment, so end users never need to know the " +
+							"internal secret layout -- they supply only cloud_account_id. Set this only " +
+							"when the credentials live somewhere non-standard.",
 						Optional: true,
 					},
 					"subscription_id": schema.StringAttribute{

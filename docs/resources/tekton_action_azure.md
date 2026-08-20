@@ -27,11 +27,20 @@ The blueprint holds only a cloud-account id.
 ```hcl
 provider "facets" {
   azure = {
-    cloud_account_id    = "6851457022e37005a59327d0"
-    secret_manager_path = "facetsdemo/backend/accounts/6851457022e37005a59327d0"
+    cloud_account_id = "6851457022e37005a59327d0"
   }
 }
 ```
+
+A cloud-account id is the only input. The secret id is derived at apply time from
+the control plane's own environment (`TF_VAR_CP_NAME` / `TF_VAR_CP_CLOUD`), using
+the same convention as `cloudaccount-fetch-secret/secret-fetcher.py` — so **end
+users never need to know the internal secret layout**. `secret_manager_path` is
+an optional override for non-standard locations.
+
+Note the derivation happens at apply time, not run time: the action pod does not
+carry `TF_VAR_CP_NAME` (only the release pod does), so the resolved id is baked
+into the generated step.
 
 Nothing sensitive is stored in Terraform state, in the Tekton `Task` manifest, or
 in a Kubernetes Secret — and there is **no per-cluster setup**. This reuses the
