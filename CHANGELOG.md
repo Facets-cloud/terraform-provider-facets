@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Client secret mode** — read at pod start from the `facets-azure-credentials` Kubernetes Secret via `secretKeyRef`, so the value does not appear in the rendered Task manifest.
   - Setting both `client_secret` and `use_oidc_federation`, or neither, is rejected with a clear diagnostic.
   - Injects `AZURE_CONFIG_DIR` into user steps, mirroring how the AWS variant injects `AWS_CONFIG_FILE`.
+  - Uses `mcr.microsoft.com/azure-cli:2.61.0` for the credential-setup step. `facetscloud/actions-base-image:v1.0.0` bundles `awscli` and `kubectl` but has **no `az` CLI** (verified against the published image), so `az login` would fail there.
+  - 19 unit tests covering config validation (both auth modes, mutual exclusivity, required/empty fields) and script generation (no secret inlined, correct flags per mode, missing-token guard).
+
+### Known limitation
+`use_oidc_federation` needs a control-plane change before it can be used. Verified against a live action run: the CP creates TaskRuns with a fixed `serviceAccountName` (`facets-actions-sa`) and `podTemplate: null`, so an action cannot request its own projected volume. The pod already receives a projected token (the EKS pod-identity webhook injects one for the `eks.amazonaws.com/role-arn` annotation), but its audience is `sts.amazonaws.com` rather than `api://AzureADTokenExchange`, so Entra rejects it with `AADSTS700212`. Fix is additive on the CP side — project a second token with the Azure audience, or let actions declare a service account / pod template. **Client-secret mode works today with no CP change.**
 
 ### Why
 Before this change the only way to run `az` from an action was `facets_tekton_action_kubernetes` with credentials as Tekton params, forcing a human to paste a client secret on every run. The alternative — interpolating the secret into the step `script`/`env` — persists it in **both** Terraform state and the in-cluster Task manifest, because nothing in this provider is marked `Sensitive` and step `env` accepts only literal values. This resource removes that trade-off.

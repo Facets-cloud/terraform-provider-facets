@@ -13,6 +13,17 @@ import (
 // exports AWS_CONFIG_FILE.
 const AzureConfigDir = "/workspace/.azure"
 
+// AzureSetupImage is the image used by the credential-setup StepAction.
+//
+// It deliberately differs from the AWS/Kubernetes variants, which use
+// facetscloud/actions-base-image. That image bundles awscli and kubectl but has
+// NO az CLI (verified against the published image: Alpine 3.19 with bash, curl,
+// jq, python3, awscli, kubectl, yq, git), so `az login` would fail there.
+//
+// If az is added to facetscloud/actions-base-image in future, this can be
+// switched back so all three action types share one image.
+const AzureSetupImage = "mcr.microsoft.com/azure-cli:2.61.0"
+
 // BuildAzureStepAction creates a StepAction that authenticates the Azure CLI so
 // that subsequent user steps can call `az ...` without handling credentials
 // themselves.
@@ -26,7 +37,7 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 	}
 
 	spec := map[string]interface{}{
-		"image":  "facetscloud/actions-base-image:v1.0.0",
+		"image":  AzureSetupImage,
 		"script": GenerateAzureLoginScript(azureConfig),
 	}
 

@@ -50,6 +50,23 @@ For AKS, enable `oidc_issuer_enabled` and `workload_identity_enabled` on the
 cluster. For EKS/GKE, the cluster's OIDC issuer URL is used directly — Entra ID
 accepts any OIDC issuer.
 
+> **Status: requires a control-plane change.** Verified against a live action run:
+> the control plane creates TaskRuns with a fixed `serviceAccountName`
+> (`facets-actions-sa`) and `podTemplate: null`, so an action cannot request its
+> own projected volume. The pod *does* already receive a projected token — the
+> EKS pod-identity webhook injects one because that ServiceAccount carries an
+> `eks.amazonaws.com/role-arn` annotation — but its audience is
+> `sts.amazonaws.com`, not `api://AzureADTokenExchange`, so Entra rejects it with
+> `AADSTS700212`.
+>
+> Two possible fixes, both control-plane side:
+> 1. Add a second projected token with audience `api://AzureADTokenExchange` to
+>    the TaskRun pod template (additive; does not disturb the existing AWS token).
+> 2. Let the action declare a service account / pod template, so an
+>    Azure-federated ServiceAccount can be used.
+>
+> Until then, use **client secret** mode, which needs no control-plane change.
+
 ### Client secret
 
 ```hcl
@@ -87,6 +104,17 @@ Identical to [`facets_tekton_action_aws`](tekton_action_aws.md):
 * `id` — `namespace/task_name`
 * `task_name` — generated Tekton Task name (hash-based, max 63 chars)
 * `step_action_name` — generated StepAction name for credential setup
+
+## Step image
+
+The credential-setup StepAction uses `mcr.microsoft.com/azure-cli:2.61.0` rather than
+`facetscloud/actions-base-image:v1.0.0`, which the AWS and Kubernetes variants use.
+
+That base image is Alpine 3.19 with `bash`, `curl`, `jq`, `python3`, `awscli`,
+`kubectl`, `yq` and `git` — it has **no `az` CLI**, so `az login` would fail there.
+If `az` is added to the base image, `AzureSetupImage` in
+`internal/provider/tekton/stepaction_azure.go` can be pointed back at it so all
+three action types share one image.
 
 ## Environment variables available to your steps
 
