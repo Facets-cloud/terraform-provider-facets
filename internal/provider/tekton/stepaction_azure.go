@@ -24,6 +24,36 @@ const AzureConfigDir = "/workspace/.azure"
 // switched back so all three action types share one image.
 const AzureSetupImage = "mcr.microsoft.com/azure-cli:2.61.0"
 
+// AzureFetchImage runs the secret-manager fetch step. It must contain the aws CLI
+// and jq; the azure-cli image has jq but no aws (and no boto3), so the shared
+// Facets base image is used instead.
+const AzureFetchImage = "facetscloud/actions-base-image:v1.0.0"
+
+// AzureLoginStepName is the name of the step that performs `az login` in
+// secret-manager mode, injected after the credential fetch.
+const AzureLoginStepName = "azure-login"
+
+// GenerateAzureSecretManagerLoginScript renders the az login step that consumes
+// the credentials written by the fetch step, then shreds them.
+func GenerateAzureSecretManagerLoginScript() string {
+	return fmt.Sprintf(`#!/bin/bash
+set -e
+export AZURE_CONFIG_DIR=%s
+CREDS_FILE=%s/creds.json
+
+az login --service-principal \
+  --username "$(jq -r .clientId "$CREDS_FILE")" \
+  --password "$(jq -r .clientSecret "$CREDS_FILE")" \
+  --tenant "$(jq -r .tenantId "$CREDS_FILE")" \
+  --output none
+
+az account set --subscription "$(jq -r .subscriptionId "$CREDS_FILE")"
+
+# The credentials are no longer needed; remove them before user steps run.
+shred -u "$CREDS_FILE" 2>/dev/null || rm -f "$CREDS_FILE"
+`, AzureConfigDir, AzureConfigDir)
+}
+
 // BuildAzureStepAction creates a StepAction that authenticates the Azure CLI so
 // that subsequent user steps can call `az ...` without handling credentials
 // themselves.
@@ -36,15 +66,22 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 		return nil, fmt.Errorf("azure config is nil")
 	}
 
+	// Secret-manager mode fetches from AWS Secrets Manager and so needs the aws
+	// CLI, which lives in the base image; the other modes call az directly.
+	image := AzureSetupImage
+	if azureConfig.Mode == azure.AuthModeSecretManager {
+		image = AzureFetchImage
+	}
+
 	spec := map[string]interface{}{
-		"image":  AzureSetupImage,
+		"image":  image,
 		"script": GenerateAzureLoginScript(azureConfig),
 	}
 
 	// Client-secret mode passes the secret through an env var sourced from a
 	// Kubernetes Secret rather than baking it into the script, so the rendered
 	// Task manifest never contains the secret value.
-	if !azureConfig.UseOIDCFederation {
+	if azureConfig.Mode == azure.AuthModeClientSecret {
 		spec["env"] = []interface{}{
 			map[string]interface{}{
 				"name": "FACETS_AZURE_CLIENT_SECRET",
@@ -91,7 +128,40 @@ func GenerateAzureLoginScript(config *azure.AzureAuthConfig) string {
 	b.WriteString(fmt.Sprintf("export AZURE_CONFIG_DIR=%s\n", AzureConfigDir))
 	b.WriteString(fmt.Sprintf("mkdir -p %s\n\n", AzureConfigDir))
 
-	if config.UseOIDCFederation {
+	if config.Mode == azure.AuthModeSecretManager {
+		// Resolve the Azure credentials at run time using the pod's own cloud
+		// identity (IRSA on EKS), which the control plane already authorises for
+		// secretsmanager:GetSecretValue. Nothing sensitive is stored in Terraform
+		// state, in the Task manifest, or in a Kubernetes Secret.
+		//
+		// This step runs on the base image because it needs the aws CLI; the
+		// azure-cli image has az and jq but no aws. The credentials are written to
+		// the shared /workspace volume and consumed by the az login step that
+		// follows, then shredded.
+		b.WriteString(fmt.Sprintf(`SECRET_ID=%q
+CREDS_FILE=%s/creds.json
+
+aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
+  --query SecretString --output text > "$CREDS_FILE"
+chmod 600 "$CREDS_FILE"
+
+if [ ! -s "$CREDS_FILE" ]; then
+    echo "ERROR: could not read $SECRET_ID from AWS Secrets Manager." >&2
+    echo "The pod's service account needs secretsmanager:GetSecretValue." >&2
+    exit 1
+fi
+
+for k in clientId clientSecret tenantId subscriptionId; do
+    if [ -z "$(jq -r --arg k "$k" '.[$k] // empty' "$CREDS_FILE")" ]; then
+        echo "ERROR: $k missing from $SECRET_ID." >&2
+        exit 1
+    fi
+done
+`, config.SecretManagerPath, AzureConfigDir))
+		return b.String()
+	}
+
+	if config.Mode == azure.AuthModeOIDCFederation {
 		b.WriteString(fmt.Sprintf("TOKEN_FILE=%q\n", config.FederatedTokenFile))
 		b.WriteString(`if [ ! -s "$TOKEN_FILE" ]; then
     echo "ERROR: federated token not found at $TOKEN_FILE." >&2

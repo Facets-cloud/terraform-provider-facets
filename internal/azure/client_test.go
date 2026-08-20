@@ -16,6 +16,8 @@ var azureAttrTypes = map[string]attr.Type{
 	"client_secret":        types.StringType,
 	"use_oidc_federation":  types.BoolType,
 	"federated_token_file": types.StringType,
+	"cloud_account_id":     types.StringType,
+	"secret_manager_path":  types.StringType,
 }
 
 // newModel builds a ProviderModel with the given azure block values. Nil values
@@ -29,6 +31,8 @@ func newModel(t *testing.T, vals map[string]attr.Value) *ProviderModel {
 		"client_secret":        types.StringNull(),
 		"use_oidc_federation":  types.BoolNull(),
 		"federated_token_file": types.StringNull(),
+		"cloud_account_id":     types.StringNull(),
+		"secret_manager_path":  types.StringNull(),
 	}
 	for k, v := range vals {
 		full[k] = v
@@ -183,5 +187,67 @@ func TestGetAzureConfig_RejectsEmptyRequiredField(t *testing.T) {
 	})
 	if _, err := GetAzureConfig(context.Background(), m); err == nil {
 		t.Fatal("expected an error for an empty subscription_id")
+	}
+}
+
+// --- secret-manager mode (the recommended path) ---
+
+func smModel(t *testing.T) *ProviderModel {
+	return newModel(t, map[string]attr.Value{
+		"cloud_account_id":    types.StringValue("acct-123"),
+		"secret_manager_path": types.StringValue("cluster/backend/accounts/acct-123"),
+	})
+}
+
+// The whole point: no identity fields and no secret are required.
+func TestGetAzureConfig_SecretManagerMode(t *testing.T) {
+	cfg, err := GetAzureConfig(context.Background(), smModel(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Mode != AuthModeSecretManager {
+		t.Errorf("mode = %v, want AuthModeSecretManager", cfg.Mode)
+	}
+	if cfg.CloudAccountID != "acct-123" {
+		t.Errorf("cloud account id = %q", cfg.CloudAccountID)
+	}
+	if cfg.SecretManagerPath != "cluster/backend/accounts/acct-123" {
+		t.Errorf("secret path = %q", cfg.SecretManagerPath)
+	}
+	if cfg.ClientSecret != "" {
+		t.Error("no secret should be held in secret-manager mode")
+	}
+}
+
+func TestGetAzureConfig_SecretManager_RequiresPath(t *testing.T) {
+	m := newModel(t, map[string]attr.Value{
+		"cloud_account_id": types.StringValue("acct-123"),
+	})
+	_, err := GetAzureConfig(context.Background(), m)
+	if err == nil {
+		t.Fatal("expected an error when secret_manager_path is missing")
+	}
+	if !strings.Contains(err.Error(), "secret_manager_path") {
+		t.Errorf("error should name secret_manager_path, got: %v", err)
+	}
+}
+
+func TestGetAzureConfig_SecretManager_RejectsMixedModes(t *testing.T) {
+	for name, extra := range map[string]map[string]attr.Value{
+		"with client_secret":       {"client_secret": types.StringValue("shhh")},
+		"with use_oidc_federation": {"use_oidc_federation": types.BoolValue(true)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vals := map[string]attr.Value{
+				"cloud_account_id":    types.StringValue("acct-123"),
+				"secret_manager_path": types.StringValue("p"),
+			}
+			for k, v := range extra {
+				vals[k] = v
+			}
+			if _, err := GetAzureConfig(context.Background(), newModel(t, vals)); err == nil {
+				t.Fatal("expected an error for mixed auth modes")
+			}
+		})
 	}
 }

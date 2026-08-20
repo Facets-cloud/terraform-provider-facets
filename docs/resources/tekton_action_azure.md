@@ -18,6 +18,35 @@ removes the trade-off.
 
 ## Authentication modes
 
+### Secret manager (recommended)
+
+The action resolves the credentials at run time from the control plane's secret
+store, using the pod's own cloud identity (IRSA on an EKS-hosted control plane).
+The blueprint holds only a cloud-account id.
+
+```hcl
+provider "facets" {
+  azure = {
+    cloud_account_id    = "6851457022e37005a59327d0"
+    secret_manager_path = "facetsdemo/backend/accounts/6851457022e37005a59327d0"
+  }
+}
+```
+
+Nothing sensitive is stored in Terraform state, in the Tekton `Task` manifest, or
+in a Kubernetes Secret — and there is **no per-cluster setup**. This reuses the
+same secret layout the `cloud_account` modules already read via
+`secret-fetcher.py`.
+
+Two steps are generated: a fetch step on `facetscloud/actions-base-image` (it
+needs the `aws` CLI, which the azure-cli image lacks) writes the credentials to
+the shared `/workspace/.azure`, then an `az login` step on the azure-cli image
+consumes and shreds them. User steps run already authenticated.
+
+Requires the action pod's service account to be authorised for
+`secretsmanager:GetSecretValue` — which the Facets release-pod IRSA role already
+grants.
+
 ### OIDC federation (preferred)
 
 Microsoft Entra ID exchanges the pod's projected service-account token for an Azure

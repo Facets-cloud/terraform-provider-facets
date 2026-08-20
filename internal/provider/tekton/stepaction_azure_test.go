@@ -12,6 +12,7 @@ func oidcConfig() *azure.AzureAuthConfig {
 		SubscriptionID:     "sub-1",
 		TenantID:           "tenant-1",
 		ClientID:           "client-1",
+		Mode:               azure.AuthModeOIDCFederation,
 		UseOIDCFederation:  true,
 		FederatedTokenFile: azure.DefaultFederatedTokenFile,
 	}
@@ -23,6 +24,7 @@ func secretConfig() *azure.AzureAuthConfig {
 		TenantID:       "tenant-1",
 		ClientID:       "client-1",
 		ClientSecret:   "super-secret-value",
+		Mode:           azure.AuthModeClientSecret,
 	}
 }
 
@@ -185,5 +187,84 @@ func TestGenerateAzureLoginScript_SetsConfigDir(t *testing.T) {
 				t.Errorf("script should export AZURE_CONFIG_DIR\n---\n%s", s)
 			}
 		})
+	}
+}
+
+// --- secret-manager mode ---
+
+func smConfig() *azure.AzureAuthConfig {
+	return &azure.AzureAuthConfig{
+		Mode:              azure.AuthModeSecretManager,
+		CloudAccountID:    "acct-123",
+		SecretManagerPath: "cluster/backend/accounts/acct-123",
+	}
+}
+
+// The fetch step needs the aws CLI, which the azure-cli image does NOT have
+// (verified: it ships az, jq and python3 but no aws and no boto3).
+func TestBuildAzureStepAction_SecretManager_UsesFetchImage(t *testing.T) {
+	sa, err := BuildAzureStepAction("sa", "tekton-pipelines", nil, smConfig())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	spec := sa.Object["spec"].(map[string]interface{})
+	if got := spec["image"]; got != AzureFetchImage {
+		t.Errorf("image = %v, want %v (needs the aws CLI)", got, AzureFetchImage)
+	}
+}
+
+// Nothing sensitive exists to pass, so no env var and no secretKeyRef.
+func TestBuildAzureStepAction_SecretManager_NoEnvNoSecretRef(t *testing.T) {
+	sa, err := BuildAzureStepAction("sa", "tekton-pipelines", nil, smConfig())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	spec := sa.Object["spec"].(map[string]interface{})
+	if _, present := spec["env"]; present {
+		t.Error("secret-manager mode needs no env var; credentials are fetched at run time")
+	}
+	if strings.Contains(spec["script"].(string), "secretKeyRef") {
+		t.Error("secret-manager mode must not reference a Kubernetes Secret")
+	}
+}
+
+func TestGenerateAzureLoginScript_SecretManager(t *testing.T) {
+	cfg := smConfig()
+	s := GenerateAzureLoginScript(cfg)
+
+	for _, want := range []string{
+		"aws secretsmanager get-secret-value",
+		cfg.SecretManagerPath,
+		"clientId",
+		"clientSecret",
+		"tenantId",
+		"subscriptionId",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("fetch script missing %q\n---\n%s", want, s)
+		}
+	}
+	// The fetch step must not attempt az login -- that happens in the injected
+	// azure-cli step, because this step runs on an image without az.
+	if strings.Contains(s, "az login") {
+		t.Error("fetch step must not call az login; it runs on the base image")
+	}
+}
+
+func TestGenerateAzureSecretManagerLoginScript(t *testing.T) {
+	s := GenerateAzureSecretManagerLoginScript()
+
+	if !strings.Contains(s, "az login --service-principal") {
+		t.Error("login step should call az login")
+	}
+	if !strings.Contains(s, "az account set --subscription") {
+		t.Error("login step should select the subscription")
+	}
+	// Credentials must not outlive the login step.
+	if !strings.Contains(s, "shred") && !strings.Contains(s, "rm -f") {
+		t.Error("login step should remove the credentials file after use")
+	}
+	if !strings.Contains(s, AzureConfigDir) {
+		t.Error("login step should use the shared azure config dir")
 	}
 }

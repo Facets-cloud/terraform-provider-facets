@@ -358,7 +358,7 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), azureConfig.Mode)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -596,7 +596,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), azureConfig.Mode)
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -773,7 +773,7 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 }
 
 // buildAzureTask creates the Tekton Task for Azure workflows
-func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
+func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels map[string]interface{}, azureMode azure.AuthMode) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
@@ -788,7 +788,18 @@ func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan Tek
 		},
 	}
 
-	// Add user-defined steps with AWS_CONFIG_FILE env var
+	// In secret-manager mode the setup step only FETCHES the credentials (it runs
+	// on the base image, which has aws). Inject the az login step here, on the
+	// azure-cli image, so user steps land already authenticated.
+	if azureMode == azure.AuthModeSecretManager {
+		tektonSteps = append(tektonSteps, map[string]interface{}{
+			"name":   tekton.AzureLoginStepName,
+			"image":  tekton.AzureSetupImage,
+			"script": tekton.GenerateAzureSecretManagerLoginScript(),
+		})
+	}
+
+	// Add user-defined steps with AZURE_CONFIG_DIR pointing at the shared profile
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
 		// Point the Azure CLI at the profile written by the setup-credentials step

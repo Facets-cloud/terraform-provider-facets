@@ -99,17 +99,36 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 					"the action never supplies credentials.",
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
+					"cloud_account_id": schema.StringAttribute{
+						Description: "RECOMMENDED. ID of the Facets-linked Azure cloud account. The action " +
+							"resolves that account's credentials at run time using the pod's own cloud " +
+							"identity, so nothing sensitive is stored in Terraform state, in the Tekton " +
+							"Task manifest, or in a Kubernetes Secret -- and no per-cluster setup is " +
+							"required. Mutually exclusive with client_secret and use_oidc_federation; " +
+							"when set, subscription_id / tenant_id / client_id are resolved at run time " +
+							"and need not be supplied. Requires secret_manager_path.",
+						Optional: true,
+					},
+					"secret_manager_path": schema.StringAttribute{
+						Description: "Secret id holding the cloud account credentials, e.g. " +
+							"\"<cluster>/backend/accounts/<cloud_account_id>\". Required with " +
+							"cloud_account_id.",
+						Optional: true,
+					},
 					"subscription_id": schema.StringAttribute{
-						Description: "Azure subscription ID that owns the target resources.",
-						Required:    true,
+						Description: "Azure subscription ID that owns the target resources. Not required " +
+							"in cloud_account_id mode.",
+						Optional: true,
 					},
 					"tenant_id": schema.StringAttribute{
-						Description: "Microsoft Entra ID (Azure AD) tenant ID.",
-						Required:    true,
+						Description: "Microsoft Entra ID (Azure AD) tenant ID. Not required in " +
+							"cloud_account_id mode.",
+						Optional: true,
 					},
 					"client_id": schema.StringAttribute{
-						Description: "Application (client) ID of the service principal / managed identity.",
-						Required:    true,
+						Description: "Application (client) ID of the service principal / managed identity. " +
+							"Not required in cloud_account_id mode.",
+						Optional: true,
 					},
 					"client_secret": schema.StringAttribute{
 						Description: "Service principal client secret. Mutually exclusive with " +
