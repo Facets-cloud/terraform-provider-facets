@@ -13,6 +13,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
@@ -57,6 +59,8 @@ type TektonActionAzureResourceModel struct {
 	FacetsResourceName types.String `tfsdk:"facets_resource_name"`
 	FacetsEnvironment  types.Object `tfsdk:"facets_environment"`
 	FacetsResource     types.Object `tfsdk:"facets_resource"`
+	Namespace          types.String `tfsdk:"namespace"`
+	Labels             types.Map    `tfsdk:"labels"`
 	Steps              types.List   `tfsdk:"steps"`
 	Params             types.List   `tfsdk:"params"`
 	TaskName           types.String `tfsdk:"task_name"`
@@ -125,6 +129,29 @@ func (r *TektonActionAzureResource) Schema(ctx context.Context, req resource.Sch
 						Required:    true,
 					},
 				},
+			},
+			"namespace": schema.StringAttribute{
+				Description: "Kubernetes namespace for Tekton resources. Changing this forces recreation of the resource.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(
+						regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`),
+						"must be a valid Kubernetes namespace name (lowercase alphanumeric and hyphens, cannot start or end with hyphen)",
+					),
+					stringvalidator.LengthAtMost(63),
+				},
+			},
+			"labels": schema.MapAttribute{
+				Description: "Custom labels to apply to the Tekton Task and StepAction resources. " +
+					"These labels are merged with auto-generated labels (display_name, resource_name, " +
+					"resource_kind, environment_unique_name, cluster_id). Auto-generated labels take " +
+					"precedence and cannot be overwritten.",
+				Optional:    true,
+				ElementType: types.StringType,
 			},
 			"steps": schema.ListNestedAttribute{
 				Description: "List of steps for the Tekton Task",
@@ -311,14 +338,25 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 	plan.StepActionName = types.StringValue(names.StepActionName)
 	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", tektonPipelinesNamespace, names.TaskName))
 
-	// Create metadata (no custom labels for Azure actions currently)
+	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
+		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
+	}
+
+	customLabels := make(map[string]string)
+	if !plan.Labels.IsNull() {
+		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		true, // cloud_action: true for Azure actions
-		nil,  // customLabels: not supported for Azure actions yet
+		true,         // cloud_action: true for Azure actions
+		customLabels, // customLabels: not supported for Azure actions yet
 	)
 
 	// Validate provider data is available
@@ -549,14 +587,25 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 
-	// Create metadata (no custom labels for Azure actions currently)
+	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
+		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
+	}
+
+	customLabels := make(map[string]string)
+	if !plan.Labels.IsNull() {
+		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		true, // cloud_action: true for Azure actions
-		nil,  // customLabels: not supported for Azure actions yet
+		true,         // cloud_action: true for Azure actions
+		customLabels, // customLabels: not supported for Azure actions yet
 	)
 
 	// Validate provider data is available
@@ -827,7 +876,7 @@ func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan Tek
 
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
-		Namespace:   tektonPipelinesNamespace,
+		Namespace:   plan.Namespace.ValueString(),
 		Description: description,
 		Labels:      labels,
 	}, tektonSteps, taskParams)
