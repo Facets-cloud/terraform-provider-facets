@@ -17,7 +17,17 @@ type FacetsProvider struct {
 }
 
 type FacetsProviderModel struct {
-	AWS types.Object `tfsdk:"aws"`
+	AWS   types.Object `tfsdk:"aws"`
+	Azure types.Object `tfsdk:"azure"`
+}
+
+type ProviderAzureConfig struct {
+	SubscriptionID     types.String `tfsdk:"subscription_id"`
+	TenantID           types.String `tfsdk:"tenant_id"`
+	ClientID           types.String `tfsdk:"client_id"`
+	ClientSecret       types.String `tfsdk:"client_secret"`
+	UseOIDCFederation  types.Bool   `tfsdk:"use_oidc_federation"`
+	FederatedTokenFile types.String `tfsdk:"federated_token_file"`
 }
 
 type ProviderAWSConfig struct {
@@ -79,6 +89,51 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 					},
 				},
 			},
+			"azure": schema.SingleNestedAttribute{
+				Description: "Azure configuration for facets_tekton_action_azure resources. " +
+					"Optional; only required when using Azure actions. Two authentication modes are " +
+					"supported: OIDC federation (preferred -- Microsoft Entra ID exchanges the pod's " +
+					"projected service-account token for an Azure token, so no secret exists anywhere, " +
+					"and it works cross-cloud from an EKS-hosted pod), or a service principal client " +
+					"secret read from a Kubernetes Secret at pod start. Either way the user triggering " +
+					"the action never supplies credentials.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"subscription_id": schema.StringAttribute{
+						Description: "Azure subscription ID that owns the target resources.",
+						Required:    true,
+					},
+					"tenant_id": schema.StringAttribute{
+						Description: "Microsoft Entra ID (Azure AD) tenant ID.",
+						Required:    true,
+					},
+					"client_id": schema.StringAttribute{
+						Description: "Application (client) ID of the service principal / managed identity.",
+						Required:    true,
+					},
+					"client_secret": schema.StringAttribute{
+						Description: "Service principal client secret. Mutually exclusive with " +
+							"use_oidc_federation. Prefer OIDC federation where the federated credential " +
+							"can be registered, since a secret set here is persisted in Terraform state.",
+						Optional:  true,
+						Sensitive: true,
+					},
+					"use_oidc_federation": schema.BoolAttribute{
+						Description: "Authenticate by exchanging the pod's projected service-account token " +
+							"with Microsoft Entra ID instead of using a client secret. Requires a federated " +
+							"identity credential on the app registration trusting the cluster OIDC issuer, " +
+							"with audience api://AzureADTokenExchange.",
+						Optional: true,
+					},
+					"federated_token_file": schema.StringAttribute{
+						Description: "In-pod path of the projected service-account token. Defaults to " +
+							"/var/run/secrets/azure/tokens/azure-identity-token. The token must be projected " +
+							"with audience api://AzureADTokenExchange -- reusing the default service-account " +
+							"token fails with AADSTS700212.",
+						Optional: true,
+					},
+				},
+			},
 		},
 	}
 }
@@ -101,6 +156,7 @@ func (p *FacetsProvider) Resources(ctx context.Context) []func() resource.Resour
 	return []func() resource.Resource{
 		NewTektonActionKubernetesResource,
 		NewTektonActionAWSResource,
+		NewTektonActionAzureResource,
 	}
 }
 

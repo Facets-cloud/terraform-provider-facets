@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`facets_tekton_action_azure`** — first-class Azure action type, so Azure actions get the same one-click experience AWS actions already have. Credentials are configured once in the provider `azure` block and injected by a prepended `setup-credentials` step; the user triggering the action never supplies them.
+  - **OIDC federation mode** (`use_oidc_federation = true`) — Microsoft Entra ID exchanges the pod's projected service-account token for an Azure token, so **no client secret exists anywhere**. The Azure analogue of the AWS variant's IRSA flow, and it works cross-cloud: a pod in an EKS control-plane cluster can authenticate to Azure. Requires a federated identity credential trusting the cluster's OIDC issuer with audience `api://AzureADTokenExchange`.
+  - **Client secret mode** — read at pod start from the `facets-azure-credentials` Kubernetes Secret via `secretKeyRef`, so the value does not appear in the rendered Task manifest.
+  - Setting both `client_secret` and `use_oidc_federation`, or neither, is rejected with a clear diagnostic.
+  - Injects `AZURE_CONFIG_DIR` into user steps, mirroring how the AWS variant injects `AWS_CONFIG_FILE`.
+
+### Why
+Before this change the only way to run `az` from an action was `facets_tekton_action_kubernetes` with credentials as Tekton params, forcing a human to paste a client secret on every run. The alternative — interpolating the secret into the step `script`/`env` — persists it in **both** Terraform state and the in-cluster Task manifest, because nothing in this provider is marked `Sensitive` and step `env` accepts only literal values. This resource removes that trade-off.
+
+### Compatibility
+No changes to `facets_tekton_action_aws` or `facets_tekton_action_kubernetes`. No schema changes to existing resources. All existing tests pass unchanged.
+
 ## [1.2.1] - 2026-05-14
 
 ### Fixed
