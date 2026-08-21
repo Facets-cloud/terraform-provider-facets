@@ -381,16 +381,6 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 
-	// A lone alternative mode is indistinguishable from a deliberate choice, so it
-	// would otherwise apply cleanly and fail only when someone clicks the action.
-	// Verify the mode's prerequisites here instead.
-	if azureConfig.Mode == azure.AuthModeOIDCFederation {
-		if err := operations.VerifyOIDCFederationPossible(ctx, tektonPipelinesNamespace); err != nil {
-			resp.Diagnostics.AddError("OIDC federation is not usable on this cluster", err.Error())
-			return
-		}
-	}
-
 	// The provider owns the credentials Secret in client-secret mode. Creating it
 	// here -- rather than requiring it out of band -- is what lets the derived name
 	// stay an implementation detail: nobody has to be told a name, because nobody
@@ -692,16 +682,6 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 	}
 
 	// Update StepAction
-	// A lone alternative mode is indistinguishable from a deliberate choice, so it
-	// would otherwise apply cleanly and fail only when someone clicks the action.
-	// Verify the mode's prerequisites here instead.
-	if azureConfig.Mode == azure.AuthModeOIDCFederation {
-		if err := operations.VerifyOIDCFederationPossible(ctx, tektonPipelinesNamespace); err != nil {
-			resp.Diagnostics.AddError("OIDC federation is not usable on this cluster", err.Error())
-			return
-		}
-	}
-
 	// Reconcile on update too, so a rotated client secret propagates: the Secret is
 	// rewritten in place under the same derived name, and every action sharing that
 	// service principal picks up the new value on its next run.
@@ -924,17 +904,6 @@ func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan Tek
 				"name": plan.StepActionName.ValueString(),
 			},
 		},
-	}
-
-	// In secret-manager mode the setup step only FETCHES the credentials (it runs
-	// on the base image, which has aws). Inject the az login step here, on the
-	// azure-cli image, so user steps land already authenticated.
-	if azureMode == azure.AuthModeSecretManager {
-		tektonSteps = append(tektonSteps, map[string]interface{}{
-			"name":   tekton.AzureLoginStepName,
-			"image":  tekton.AzureSetupImage,
-			"script": tekton.GenerateAzureSecretManagerLoginScript(),
-		})
 	}
 
 	// Add user-defined steps with AZURE_CONFIG_DIR pointing at the shared profile

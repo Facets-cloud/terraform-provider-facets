@@ -22,12 +22,12 @@ type FacetsProviderModel struct {
 }
 
 type ProviderAzureConfig struct {
-	SubscriptionID     types.String `tfsdk:"subscription_id"`
-	TenantID           types.String `tfsdk:"tenant_id"`
-	ClientID           types.String `tfsdk:"client_id"`
-	ClientSecret       types.String `tfsdk:"client_secret"`
-	UseOIDCFederation  types.Bool   `tfsdk:"use_oidc_federation"`
-	FederatedTokenFile types.String `tfsdk:"federated_token_file"`
+	SubscriptionID types.String `tfsdk:"subscription_id"`
+	TenantID       types.String `tfsdk:"tenant_id"`
+	ClientID       types.String `tfsdk:"client_id"`
+	ClientSecret   types.String `tfsdk:"client_secret"`
+	SecretName     types.String `tfsdk:"secret_name"`
+	SecretKey      types.String `tfsdk:"secret_key"`
 }
 
 type ProviderAWSConfig struct {
@@ -91,81 +91,44 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 			},
 			"azure": schema.SingleNestedAttribute{
 				Description: "Azure configuration for facets_tekton_action_azure resources. " +
-					"Optional; only required when using Azure actions. Two authentication modes are " +
-					"supported: OIDC federation (preferred -- Microsoft Entra ID exchanges the pod's " +
-					"projected service-account token for an Azure token, so no secret exists anywhere, " +
-					"and it works cross-cloud from an EKS-hosted pod), or a service principal client " +
-					"secret read from a Kubernetes Secret at pod start. Either way the user triggering " +
-					"the action never supplies credentials.",
+					"Optional; only required when using Azure actions. Supply the service " +
+					"principal that owns the target resources: the provider creates and " +
+					"maintains the Kubernetes Secret holding its password, and the action reads " +
+					"that Secret via secretKeyRef at pod start. The user triggering the action " +
+					"never supplies credentials, and the password appears in neither Terraform " +
+					"state nor the rendered Tekton manifests.",
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
-					"cloud_account_id": schema.StringAttribute{
-						Description: "RECOMMENDED. ID of the Facets-linked Azure cloud account. The action " +
-							"resolves that account's credentials at run time using the pod's own cloud " +
-							"identity, so nothing sensitive is stored in Terraform state, in the Tekton " +
-							"Task manifest, or in a Kubernetes Secret -- and no per-cluster setup is " +
-							"required. Mutually exclusive with client_secret and use_oidc_federation; " +
-							"when set, subscription_id / tenant_id / client_id are resolved at run time " +
-							"and need not be supplied.",
-						Optional: true,
-					},
-					"secret_manager_path": schema.StringAttribute{
-						Description: "OPTIONAL override for the secret id holding the cloud account " +
-							"credentials. Normally omit this: the action derives the id at run time from " +
-							"the control plane's own environment, so end users never need to know the " +
-							"internal secret layout -- they supply only cloud_account_id. Set this only " +
-							"when the credentials live somewhere non-standard.",
-						Optional: true,
-					},
 					"subscription_id": schema.StringAttribute{
-						Description: "Azure subscription ID that owns the target resources. Not required " +
-							"in cloud_account_id mode.",
-						Optional: true,
+						Description: "Azure subscription ID that owns the target resources.",
+						Optional:    true,
 					},
 					"tenant_id": schema.StringAttribute{
-						Description: "Microsoft Entra ID (Azure AD) tenant ID. Not required in " +
-							"cloud_account_id mode.",
-						Optional: true,
+						Description: "Microsoft Entra ID (Azure AD) tenant ID.",
+						Optional:    true,
 					},
 					"client_id": schema.StringAttribute{
-						Description: "Application (client) ID of the service principal / managed identity. " +
-							"Not required in cloud_account_id mode.",
-						Optional: true,
+						Description: "Application (client) ID of the service principal.",
+						Optional:    true,
 					},
 					"client_secret": schema.StringAttribute{
-						Description: "Service principal client secret. Mutually exclusive with " +
-							"use_oidc_federation. Prefer OIDC federation where the federated credential " +
-							"can be registered, since a secret set here is persisted in Terraform state.",
+						Description: "Service principal client secret. Provider configuration is not " +
+							"persisted in Terraform state; the value is written to a Kubernetes Secret " +
+							"that the provider manages and the action consumes via secretKeyRef.",
 						Optional:  true,
 						Sensitive: true,
 					},
 					"secret_name": schema.StringAttribute{
-						Description: "Name of the Kubernetes Secret in the Tekton namespace holding the " +
-							"service principal secret, used by client-secret mode. Created out of band " +
-							"(e.g. by a k8s_resource module); this provider only references it, so the " +
-							"value never appears in the Task manifest. Defaults to " +
-							"\"facets-azure-credentials\". NOTE: Tekton actions share one namespace " +
-							"across all projects on a control plane, so set this per project to avoid " +
-							"two tenants colliding on one Secret.",
+						Description: "OPTIONAL override for the name of the managed Kubernetes Secret. " +
+							"Normally omit this: the name is derived from the service principal " +
+							"identity (tenant + client + subscription), so it needs no coordination " +
+							"between whoever operates the control plane and whoever configures the " +
+							"module, and two different service principals cannot collide.",
 						Optional: true,
 					},
 					"secret_key": schema.StringAttribute{
-						Description: "Key within secret_name holding the client secret. Defaults to " +
-							"\"client_secret\".",
-						Optional: true,
-					},
-					"use_oidc_federation": schema.BoolAttribute{
-						Description: "Authenticate by exchanging the pod's projected service-account token " +
-							"with Microsoft Entra ID instead of using a client secret. Requires a federated " +
-							"identity credential on the app registration trusting the cluster OIDC issuer, " +
-							"with audience api://AzureADTokenExchange.",
-						Optional: true,
-					},
-					"federated_token_file": schema.StringAttribute{
-						Description: "In-pod path of the projected service-account token. Defaults to " +
-							"/var/run/secrets/azure/tokens/azure-identity-token. The token must be projected " +
-							"with audience api://AzureADTokenExchange -- reusing the default service-account " +
-							"token fails with AADSTS700212.",
+						Description: "OPTIONAL override for the key within the managed Secret. " +
+							"Defaults to \"client_secret\".",
 						Optional: true,
 					},
 				},

@@ -33,27 +33,6 @@ const AzureFetchImage = "facetscloud/actions-base-image:v1.0.0"
 // secret-manager mode, injected after the credential fetch.
 const AzureLoginStepName = "azure-login"
 
-// GenerateAzureSecretManagerLoginScript renders the az login step that consumes
-// the credentials written by the fetch step, then shreds them.
-func GenerateAzureSecretManagerLoginScript() string {
-	return fmt.Sprintf(`#!/bin/bash
-set -e
-export AZURE_CONFIG_DIR=%s
-CREDS_FILE=%s/creds.json
-
-az login --service-principal \
-  --username "$(jq -r .clientId "$CREDS_FILE")" \
-  --password "$(jq -r .clientSecret "$CREDS_FILE")" \
-  --tenant "$(jq -r .tenantId "$CREDS_FILE")" \
-  --output none
-
-az account set --subscription "$(jq -r .subscriptionId "$CREDS_FILE")"
-
-# The credentials are no longer needed; remove them before user steps run.
-shred -u "$CREDS_FILE" 2>/dev/null || rm -f "$CREDS_FILE"
-`, AzureConfigDir, AzureConfigDir)
-}
-
 // BuildAzureStepAction creates a StepAction that authenticates the Azure CLI so
 // that subsequent user steps can call `az ...` without handling credentials
 // themselves.
@@ -66,22 +45,15 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 		return nil, fmt.Errorf("azure config is nil")
 	}
 
-	// Secret-manager mode fetches from AWS Secrets Manager and so needs the aws
-	// CLI, which lives in the base image; the other modes call az directly.
-	image := AzureSetupImage
-	if azureConfig.Mode == azure.AuthModeSecretManager {
-		image = AzureFetchImage
-	}
-
 	spec := map[string]interface{}{
-		"image":  image,
+		"image":  AzureSetupImage,
 		"script": GenerateAzureLoginScript(azureConfig),
 	}
 
-	// Client-secret mode passes the secret through an env var sourced from a
-	// Kubernetes Secret rather than baking it into the script, so the rendered
-	// Task manifest never contains the secret value.
-	if azureConfig.Mode == azure.AuthModeClientSecret {
+	// The password is passed through an env var sourced from a Kubernetes Secret
+	// rather than baked into the script, so the rendered Task manifest never
+	// contains the secret value.
+	{
 		spec["env"] = []interface{}{
 			map[string]interface{}{
 				"name": "FACETS_AZURE_CLIENT_SECRET",
@@ -127,75 +99,19 @@ func GenerateAzureLoginScript(config *azure.AzureAuthConfig) string {
 	b.WriteString(fmt.Sprintf("export AZURE_CONFIG_DIR=%s\n", AzureConfigDir))
 	b.WriteString(fmt.Sprintf("mkdir -p %s\n\n", AzureConfigDir))
 
-	if config.Mode == azure.AuthModeSecretManager {
-		// Resolve the Azure credentials at run time using the pod's own cloud
-		// identity (IRSA on EKS), which the control plane already authorises for
-		// secretsmanager:GetSecretValue. Nothing sensitive is stored in Terraform
-		// state, in the Task manifest, or in a Kubernetes Secret.
-		//
-		// This step runs on the base image because it needs the aws CLI; the
-		// azure-cli image has az and jq but no aws. The credentials are written to
-		// the shared /workspace volume and consumed by the az login step that
-		// follows, then shredded.
-		// SECRET_ID was resolved at apply time (see azure.DeriveSecretManagerPath),
-		// so end users only ever supply a cloud account id -- they never need to
-		// know the control plane's internal secret layout. It is baked in here
-		// because the ACTION pod, unlike the release pod, has no TF_VAR_CP_NAME.
-		b.WriteString(fmt.Sprintf(`SECRET_ID=%q
-CREDS_FILE=%s/creds.json
-
-echo "Resolving credentials for cloud account %s"
-
-aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
-  --query SecretString --output text > "$CREDS_FILE"
-chmod 600 "$CREDS_FILE"
-
-if [ ! -s "$CREDS_FILE" ]; then
-    echo "ERROR: could not read $SECRET_ID from AWS Secrets Manager." >&2
-    echo "The pod's service account needs secretsmanager:GetSecretValue." >&2
-    exit 1
-fi
-
-for k in clientId clientSecret tenantId subscriptionId; do
-    if [ -z "$(jq -r --arg k "$k" '.[$k] // empty' "$CREDS_FILE")" ]; then
-        echo "ERROR: $k missing from $SECRET_ID." >&2
-        exit 1
-    fi
-done
-`, config.SecretManagerPath, AzureConfigDir, config.CloudAccountID))
-		return b.String()
-	}
-
-	if config.Mode == azure.AuthModeOIDCFederation {
-		b.WriteString(fmt.Sprintf("TOKEN_FILE=%q\n", config.FederatedTokenFile))
-		b.WriteString(`if [ ! -s "$TOKEN_FILE" ]; then
-    echo "ERROR: federated token not found at $TOKEN_FILE." >&2
-    echo "The pod needs a projected service-account token with audience api://AzureADTokenExchange." >&2
-    exit 1
-fi
-
-`)
-		b.WriteString(fmt.Sprintf(`az login --service-principal \
-  --username %q \
-  --tenant %q \
-  --federated-token "$(cat "$TOKEN_FILE")" \
-  --output none
-`, config.ClientID, config.TenantID))
-	} else {
-		b.WriteString(`if [ -z "${FACETS_AZURE_CLIENT_SECRET:-}" ]; then
+	b.WriteString(`if [ -z "${FACETS_AZURE_CLIENT_SECRET:-}" ]; then
     echo "ERROR: FACETS_AZURE_CLIENT_SECRET is not set." >&2
     echo "Expected it from the '` + config.SecretName + `' Kubernetes Secret (key: ` + config.SecretKey + `)." >&2
     exit 1
 fi
 
 `)
-		b.WriteString(fmt.Sprintf(`az login --service-principal \
+	b.WriteString(fmt.Sprintf(`az login --service-principal \
   --username %q \
   --password "$FACETS_AZURE_CLIENT_SECRET" \
   --tenant %q \
   --output none
 `, config.ClientID, config.TenantID))
-	}
 
 	b.WriteString(fmt.Sprintf("\naz account set --subscription %q\n", config.SubscriptionID))
 
