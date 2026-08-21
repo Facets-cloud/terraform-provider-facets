@@ -3,6 +3,8 @@ package tekton
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -48,7 +50,7 @@ func (m *ResourceMetadata) Labels() map[string]string {
 	}
 
 	// Then, add auto-generated labels (these take precedence)
-	labels["display_name"] = m.DisplayName
+	labels["display_name"] = sanitizeLabelValue(m.DisplayName)
 	labels["resource_name"] = m.ResourceName
 	labels["resource_kind"] = m.ResourceKind
 	labels["environment_unique_name"] = m.EnvUniqueName
@@ -66,6 +68,41 @@ func (m *ResourceMetadata) LabelsAsInterface() map[string]interface{} {
 		result[k] = v
 	}
 	return result
+}
+
+var labelInvalidChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+
+// sanitizeLabelValue coerces an arbitrary string into a valid Kubernetes label
+// value: at most 63 characters of [A-Za-z0-9._-], beginning and ending with an
+// alphanumeric.
+//
+// display_name is a human-facing string -- "Stop Database", "Restart & Verify" --
+// and Kubernetes rejects the space, so passing it through unmodified made the whole
+// apply fail with `metadata.labels: Invalid value`. The action name is chosen by
+// whoever writes the module, so the provider cannot assume it is label-safe.
+//
+// Labels are used to correlate Tekton objects back to a resource, so a lossy but
+// deterministic transformation is fine here; the exact display name is preserved on
+// the Task spec itself, not in this label.
+func sanitizeLabelValue(v string) string {
+	v = labelInvalidChars.ReplaceAllString(v, "-")
+
+	// Collapse runs of separators so "Stop  &  Start" does not become "Stop---Start".
+	for strings.Contains(v, "--") {
+		v = strings.ReplaceAll(v, "--", "-")
+	}
+
+	if len(v) > 63 {
+		v = v[:63]
+	}
+
+	// Must begin and end alphanumeric. Trimming can empty the string entirely (e.g.
+	// a name of only punctuation), which is itself a valid label value.
+	v = strings.Trim(v, "-._")
+	if len(v) > 63 {
+		v = v[:63]
+	}
+	return v
 }
 
 func formatBool(b bool) string {

@@ -498,6 +498,37 @@ func (r *TektonActionAzureResource) Read(ctx context.Context, req resource.ReadR
 		return
 	}
 
+	// Reconcile the credentials Secret here as well as in Create/Update, because a
+	// rotated client secret changes only PROVIDER configuration -- no resource
+	// attribute moves, so Terraform reports "No changes" and never calls Update.
+	// Without this, rotating the password silently leaves the old value in the
+	// cluster and every action keeps authenticating with a credential the operator
+	// believes they have replaced.
+	//
+	// Read runs on every plan and refresh, so this is where convergence has to
+	// happen. Failures are warnings, not errors: Read must not break a plan, and
+	// Create/Update still surface a hard error on the paths that can.
+	if r.providerData != nil && !r.providerData.Azure.IsNull() {
+		azureConfig, cfgErr := azure.GetAzureConfig(ctx, &azure.ProviderModel{Azure: r.providerData.Azure})
+		if cfgErr == nil && azureConfig.Mode == azure.AuthModeClientSecret {
+			operations := tekton.NewResourceOperations(client)
+			if secErr := operations.ReconcileCredentialsSecret(
+				ctx, state.Namespace.ValueString(),
+				azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+				map[string]string{
+					"tenant-id":       azureConfig.TenantID,
+					"client-id":       azureConfig.ClientID,
+					"subscription-id": azureConfig.SubscriptionID,
+				},
+			); secErr != nil {
+				resp.Diagnostics.AddWarning(
+					"Could not reconcile the Azure credentials Secret",
+					fmt.Sprintf("The action will keep using whatever credential is already in the cluster: %s", secErr),
+				)
+			}
+		}
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
