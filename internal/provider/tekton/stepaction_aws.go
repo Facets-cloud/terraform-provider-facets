@@ -88,9 +88,9 @@ chmod 600 /workspace/.aws/config
 `
 
 	return fmt.Sprintf(script,
-		assumeRole.RoleARN,  // For [default] role_arn (target role)
-		sessionName,         // For [default] role_session_name
-		config.Region,       // For [default] region
+		assumeRole.RoleARN, // For [default] role_arn (target role)
+		sessionName,        // For [default] role_session_name
+		config.Region,      // For [default] region
 	)
 }
 

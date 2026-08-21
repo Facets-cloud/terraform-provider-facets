@@ -3,6 +3,7 @@ package tekton
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,6 +100,55 @@ func (r *ResourceOperations) DeleteResource(ctx context.Context, namespace, name
 	}
 	return err
 }
+
+// VerifyOIDCFederationPossible checks, at apply time, that the cluster can actually
+// mint the token OIDC federation needs.
+//
+// This exists because `use_oidc_federation = true` on its own is indistinguishable
+// from a deliberate choice, so it applies cleanly and then fails at RUN time with
+// "federated token not found" -- discovered by whoever clicks the action, not by
+// whoever configured it. The likely cause is not a deliberate choice at all: an
+// output-type mapping on a cloud_account module can inject the flag into every
+// project using that account.
+//
+// Tekton supplies the pod template from the config-defaults ConfigMap. If
+// default-pod-template does not mention the exchange audience, no action pod will
+// carry a usable token, and that is knowable now rather than later.
+func (r *ResourceOperations) VerifyOIDCFederationPossible(ctx context.Context, tektonNamespace string) error {
+	gvr := k8sschema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+
+	cm, err := r.client.Resource(gvr).Namespace(tektonNamespace).Get(ctx, "config-defaults", metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsForbidden(err) || k8serrors.IsNotFound(err) {
+			// Cannot determine it; do not block an apply on a permissions gap.
+			return nil
+		}
+		return nil
+	}
+
+	data, ok := cm.Object["data"].(map[string]interface{})
+	if !ok {
+		data = map[string]interface{}{}
+	}
+	tmpl, _ := data["default-pod-template"].(string)
+
+	if !strings.Contains(tmpl, azureTokenExchangeAudience) {
+		return fmt.Errorf("use_oidc_federation is set, but this cluster cannot issue the "+
+			"required token: the %q ConfigMap in namespace %q has no default-pod-template "+
+			"projecting audience %q.\n"+
+			"Action pods would fail at run time with \"federated token not found\".\n\n"+
+			"If you did not intend OIDC federation, remove use_oidc_federation and set "+
+			"client_secret instead -- the provider then manages the credentials Secret for you.\n"+
+			"To enable OIDC, add default-pod-template projecting that audience and register a "+
+			"federated identity credential on the app registration.",
+			"config-defaults", tektonNamespace, azureTokenExchangeAudience)
+	}
+	return nil
+}
+
+// azureTokenExchangeAudience is the audience Microsoft Entra ID requires on a
+// federated token presented for credential exchange.
+const azureTokenExchangeAudience = "api://AzureADTokenExchange"
 
 // ReconcileCredentialsSecret creates or updates the Secret holding the Azure
 // service principal password, and returns nothing but an error.

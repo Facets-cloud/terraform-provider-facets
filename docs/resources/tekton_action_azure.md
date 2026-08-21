@@ -32,6 +32,22 @@ The modes are mutually exclusive and the provider rejects combinations rather th
 guessing: `cloud_account_id` with either of the others, or `client_secret` together
 with `use_oidc_federation`, is an error naming the conflict.
 
+Because these fields can be populated by an output-type mapping on a `cloud_account`
+module -- and would then apply to every project using that account -- a mode is also
+checked for feasibility at apply time, not just for consistency:
+
+| Mistake | When it surfaces |
+|---|---|
+| `client_secret` + `use_oidc_federation` | apply — conflicting modes |
+| `client_secret` + `cloud_account_id` | apply — conflicting modes |
+| `use_oidc_federation` alone, cluster not set up for it | apply — cluster cannot issue a token with the exchange audience |
+| `cloud_account_id` alone, no control-plane env | apply — the secret id cannot be derived |
+
+The point of the third row is that a lone `use_oidc_federation = true` looks like a
+deliberate choice. Without the check it applies cleanly and fails later with
+`federated token not found`, seen first by whoever clicks the action rather than
+whoever configured it.
+
 > **Which one to use:** set `client_secret`. That is the mode this resource is
 > deployed with today, and the only one exercised end to end against a live control
 > plane. OIDC federation is the intended end state — it removes the standing secret

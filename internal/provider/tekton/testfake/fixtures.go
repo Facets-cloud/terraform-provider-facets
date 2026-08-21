@@ -67,3 +67,23 @@ func Secret(namespace, name string, data map[string]string) *unstructured.Unstru
 		},
 	}
 }
+
+// ConfigMap returns a core/v1 ConfigMap fixture. Used for Tekton's
+// config-defaults, which decides whether OIDC federation can work at all.
+func ConfigMap(namespace, name string, data map[string]string) *unstructured.Unstructured {
+	d := make(map[string]any, len(data))
+	for k, v := range data {
+		d[k] = v
+	}
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]any{
+				"namespace": namespace,
+				"name":      name,
+			},
+			"data": d,
+		},
+	}
+}

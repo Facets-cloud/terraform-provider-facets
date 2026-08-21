@@ -28,6 +28,14 @@ var (
 		Version:  "v1beta1",
 		Resource: "tasks",
 	}
+	// ConfigMapGVR is core/v1 ConfigMaps -- Tekton's config-defaults is read to
+	// determine whether OIDC federation can work at all.
+	ConfigMapGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "configmaps",
+	}
+
 	// SecretGVR is core/v1 Secrets -- the credentials Secret the provider owns.
 	SecretGVR = schema.GroupVersionResource{
 		Group:    "",
@@ -48,6 +56,7 @@ var gvrToListKind = map[schema.GroupVersionResource]string{
 	TaskGVR:       "TaskList",
 	StepActionGVR: "StepActionList",
 	SecretGVR:     "SecretList",
+	ConfigMapGVR:  "ConfigMapList",
 }
 
 // NewClient returns a fake dynamic.Interface seeded with the given objects.

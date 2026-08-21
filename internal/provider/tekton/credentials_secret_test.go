@@ -189,3 +189,52 @@ func unstructuredString(obj map[string]interface{}, fields ...string) (string, b
 	}
 	return "", false, nil
 }
+
+// A lone `use_oidc_federation = true` is indistinguishable from a deliberate
+// choice, so it used to apply cleanly and fail only when someone clicked the
+// action ("federated token not found"). The realistic cause is not a deliberate
+// choice: an output-type mapping on a cloud_account module injects the flag into
+// every project using that account. Catch it at apply instead.
+func TestVerifyOIDCFederationPossible_BlocksWhenClusterCannotIssueToken(t *testing.T) {
+	c := testfake.NewClient(testfake.ConfigMap(secretNS, "config-defaults", map[string]string{
+		"default-service-account": "facets-actions-sa",
+		// no default-pod-template -- the live facetsdemo cluster's actual state
+	}))
+	ops := NewResourceOperations(c)
+
+	err := ops.VerifyOIDCFederationPossible(context.Background(), secretNS)
+	if err == nil {
+		t.Fatal("must reject OIDC when the cluster projects no exchange-audience token")
+	}
+	// The message has to name the accidental cause and the way out, since whoever
+	// hits it may not have chosen OIDC at all.
+	for _, want := range []string{"api://AzureADTokenExchange", "remove use_oidc_federation", "client_secret"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("message must mention %q; got: %v", want, err)
+		}
+	}
+}
+
+// A cluster genuinely set up for federation must NOT be blocked.
+func TestVerifyOIDCFederationPossible_AllowsWhenConfigured(t *testing.T) {
+	c := testfake.NewClient(testfake.ConfigMap(secretNS, "config-defaults", map[string]string{
+		"default-pod-template": "volumes:\n  - name: azure-identity-token\n    projected:\n      sources:\n        - serviceAccountToken:\n            audience: api://AzureADTokenExchange\n",
+	}))
+	ops := NewResourceOperations(c)
+
+	if err := ops.VerifyOIDCFederationPossible(context.Background(), secretNS); err != nil {
+		t.Errorf("a correctly configured cluster must not be blocked: %v", err)
+	}
+}
+
+// Not being able to READ the ConfigMap is not evidence of misconfiguration, so it
+// must not fail an apply.
+func TestVerifyOIDCFederationPossible_UnreadableIsNotFatal(t *testing.T) {
+	c := testfake.NewClient()
+	testfake.WithError(c, "get", testfake.ConfigMapGVR, testfake.ErrForbidden(testfake.ConfigMapGVR, "config-defaults"))
+	ops := NewResourceOperations(c)
+
+	if err := ops.VerifyOIDCFederationPossible(context.Background(), secretNS); err != nil {
+		t.Errorf("an unreadable ConfigMap must not block the apply: %v", err)
+	}
+}
