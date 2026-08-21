@@ -2,6 +2,8 @@ package azure
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 
@@ -60,8 +62,10 @@ const (
 //     client secret exists anywhere -- this is the Azure equivalent of IRSA and
 //     works cross-cloud (an EKS-hosted pod can authenticate to Azure).
 //  2. Client secret: a service-principal password supplied via provider config.
-//     Simpler to set up but the secret is persisted in Terraform state, so mode 1
-//     should be preferred wherever the federated credential can be registered.
+//     Provider configuration is not persisted in Terraform state, and the password
+//     reaches the pod through a Secret via secretKeyRef rather than being inlined
+//     in the StepAction. Mode 1 is still preferable where the federated credential
+//     can be registered, since it removes the standing secret altogether.
 type AzureAuthConfig struct {
 	Mode AuthMode
 
@@ -106,11 +110,34 @@ type AzureAuthConfig struct {
 // fails with AADSTS700212 (audience mismatch).
 const DefaultFederatedTokenFile = "/var/run/secrets/azure/tokens/azure-identity-token"
 
-// Defaults for the Kubernetes Secret that client-secret mode reads from.
+// Naming for the Kubernetes Secret that client-secret mode reads from.
 const (
-	DefaultCredentialsSecretName = "facets-azure-credentials"
-	DefaultCredentialsSecretKey  = "client_secret"
+	// CredentialsSecretPrefix prefixes the derived Secret name.
+	CredentialsSecretPrefix = "facets-azure-creds"
+
+	// DefaultCredentialsSecretKey is the key within that Secret.
+	DefaultCredentialsSecretKey = "client_secret"
 )
+
+// DeriveSecretName names the Secret holding a service principal's password from
+// the IDENTITY of that principal.
+//
+// The point is that nobody has to be told the name. The Secret is created by
+// whoever operates the control plane, while the module referencing it is
+// configured by the customer -- and the customer cannot see the control plane's
+// namespace to look the name up. Deriving it from tenant + client +
+// subscription, which BOTH sides already hold, removes that coordination
+// entirely: each computes the same name independently.
+//
+// It also fixes multi-account control planes. Two projects using the same service
+// principal derive one name and share one Secret (correct: one credential, one
+// rotation); two projects using different principals derive different names, so
+// neither can overwrite the other's credentials. A single fixed name would
+// silently hand the second project's credentials to the first.
+func DeriveSecretName(tenantID, clientID, subscriptionID string) string {
+	sum := sha256.Sum256([]byte(tenantID + "|" + clientID + "|" + subscriptionID))
+	return CredentialsSecretPrefix + "-" + hex.EncodeToString(sum[:])[:16]
+}
 
 // GetAzureConfig extracts and validates Azure configuration from provider data.
 //
@@ -217,7 +244,8 @@ func GetAzureConfig(ctx context.Context, providerModel *ProviderModel) (*AzureAu
 		mode = AuthModeOIDCFederation
 	}
 
-	secretName := DefaultCredentialsSecretName
+	// Derived by default so neither side has to communicate the name.
+	secretName := DeriveSecretName(tenantID, clientID, subscriptionID)
 	if !azureConfig.SecretName.IsNull() && azureConfig.SecretName.ValueString() != "" {
 		secretName = azureConfig.SecretName.ValueString()
 	}

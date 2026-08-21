@@ -312,8 +312,9 @@ func TestGetAzureConfig_SecretNameDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.SecretName != DefaultCredentialsSecretName {
-		t.Errorf("default name = %q, want %q", cfg.SecretName, DefaultCredentialsSecretName)
+	want := DeriveSecretName("tenant-1", "client-1", "sub-1")
+	if cfg.SecretName != want {
+		t.Errorf("derived name = %q, want %q", cfg.SecretName, want)
 	}
 	if cfg.SecretKey != DefaultCredentialsSecretKey {
 		t.Errorf("default key = %q, want %q", cfg.SecretKey, DefaultCredentialsSecretKey)
@@ -336,5 +337,30 @@ func TestGetAzureConfig_SecretNameDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.SecretKey != "azure_client_secret" {
 		t.Errorf("override key = %q", cfg.SecretKey)
+	}
+}
+
+// The name must be derivable by both sides independently: the control-plane
+// operator creating the Secret and the customer configuring the module never
+// exchange it, and the customer cannot see the namespace to look it up.
+func TestDeriveSecretName_StableAndIdentityScoped(t *testing.T) {
+	a := DeriveSecretName("tenant-1", "client-1", "sub-1")
+	if a != DeriveSecretName("tenant-1", "client-1", "sub-1") {
+		t.Error("must be deterministic: both sides compute it independently")
+	}
+	if len(a) > 253 {
+		t.Errorf("name too long for a Kubernetes object: %d chars", len(a))
+	}
+
+	// Different principals must not collide, or one project would overwrite
+	// another's credentials on a shared control plane.
+	for _, other := range [][3]string{
+		{"tenant-2", "client-1", "sub-1"},
+		{"tenant-1", "client-2", "sub-1"},
+		{"tenant-1", "client-1", "sub-2"},
+	} {
+		if DeriveSecretName(other[0], other[1], other[2]) == a {
+			t.Errorf("collision with %v", other)
+		}
 	}
 }

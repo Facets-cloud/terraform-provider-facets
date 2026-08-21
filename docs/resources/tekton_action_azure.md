@@ -118,10 +118,42 @@ provider "facets" {
 }
 ```
 
-The secret is read at pod start from the `facets-azure-credentials` Kubernetes
-Secret via `secretKeyRef`, so it does not appear in the rendered `Task` manifest.
-Note that a secret supplied here **is** persisted in Terraform state — prefer OIDC
-federation wherever the federated credential can be registered.
+Nothing else is required: the provider creates and maintains the Kubernetes Secret
+that backs this, and the action reads it at pod start via `secretKeyRef`, so the
+password never appears in the rendered `Task` or `StepAction` manifest. Provider
+configuration is not written to Terraform state.
+
+#### How the Secret is named
+
+The name is derived from the service principal identity:
+
+```
+facets-azure-creds-<sha256(tenant_id|client_id|subscription_id)[:16]>
+```
+
+This is deliberate rather than configurable-by-default, because the two parties
+involved cannot see each other. The Secret lives in the control plane's namespace,
+while the module referencing it is configured by someone with no access to that
+namespace — so a name typed in one place cannot be looked up in the other. Deriving
+it from three values both sides already hold removes the coordination entirely.
+
+It also makes multi-account control planes safe:
+
+| Situation | Result |
+|---|---|
+| Several actions, same service principal | One derived name → one shared Secret. Applies are idempotent. |
+| Different service principals | Different names, so no project can overwrite another's credentials. |
+| Credential rotated | Same name, value rewritten in place; every action on that SP picks it up on its next run. |
+
+Because a Secret may be shared, it carries no `ownerReferences` — deleting one
+action must not garbage-collect credentials another action still uses. The Secret is
+inert without an action referencing it. It is labelled
+`app.kubernetes.io/managed-by=terraform-provider-facets` and annotated with the
+tenant, client and subscription ids, so the hashed name remains traceable to an
+identity by inspection.
+
+`secret_name` and `secret_key` may still be set in the `azure` block to pin a
+specific name — useful when adopting an existing Secret — but neither is required.
 
 Setting both `client_secret` and `use_oidc_federation`, or neither, is rejected.
 

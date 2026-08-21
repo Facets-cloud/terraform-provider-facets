@@ -381,15 +381,22 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 
-	// In client-secret mode the Secret is created out of band, so verify it now:
-	// a mismatch caught here is an actionable apply-time error, whereas the same
-	// mistake found at run time surfaces only as CreateContainerConfigError in pod
-	// events.
+	// The provider owns the credentials Secret in client-secret mode. Creating it
+	// here -- rather than requiring it out of band -- is what lets the derived name
+	// stay an implementation detail: nobody has to be told a name, because nobody
+	// has to type one. See ReconcileCredentialsSecret for why the Secret is shared
+	// rather than owned by a single action.
 	if azureConfig.Mode == azure.AuthModeClientSecret {
-		if err := operations.VerifySecretKey(
-			ctx, plan.Namespace.ValueString(), azureConfig.SecretName, azureConfig.SecretKey,
+		if err := operations.ReconcileCredentialsSecret(
+			ctx, plan.Namespace.ValueString(),
+			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+			map[string]string{
+				"tenant-id":       azureConfig.TenantID,
+				"client-id":       azureConfig.ClientID,
+				"subscription-id": azureConfig.SubscriptionID,
+			},
 		); err != nil {
-			resp.Diagnostics.AddError("Azure credentials Secret is not usable", err.Error())
+			resp.Diagnostics.AddError("Could not provision the Azure credentials Secret", err.Error())
 			return
 		}
 	}
@@ -644,13 +651,20 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 	}
 
 	// Update StepAction
-	// Same apply-time verification as Create: catch a Secret name/key mismatch here
-	// rather than letting the action fail later with CreateContainerConfigError.
+	// Reconcile on update too, so a rotated client secret propagates: the Secret is
+	// rewritten in place under the same derived name, and every action sharing that
+	// service principal picks up the new value on its next run.
 	if azureConfig.Mode == azure.AuthModeClientSecret {
-		if err := operations.VerifySecretKey(
-			ctx, plan.Namespace.ValueString(), azureConfig.SecretName, azureConfig.SecretKey,
+		if err := operations.ReconcileCredentialsSecret(
+			ctx, plan.Namespace.ValueString(),
+			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+			map[string]string{
+				"tenant-id":       azureConfig.TenantID,
+				"client-id":       azureConfig.ClientID,
+				"subscription-id": azureConfig.SubscriptionID,
+			},
 		); err != nil {
-			resp.Diagnostics.AddError("Azure credentials Secret is not usable", err.Error())
+			resp.Diagnostics.AddError("Could not provision the Azure credentials Secret", err.Error())
 			return
 		}
 	}

@@ -28,6 +28,13 @@ var (
 		Version:  "v1beta1",
 		Resource: "tasks",
 	}
+	// SecretGVR is core/v1 Secrets -- the credentials Secret the provider owns.
+	SecretGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "secrets",
+	}
+
 	StepActionGVR = schema.GroupVersionResource{
 		Group:    "tekton.dev",
 		Version:  "v1beta1",
@@ -40,11 +47,12 @@ var (
 var gvrToListKind = map[schema.GroupVersionResource]string{
 	TaskGVR:       "TaskList",
 	StepActionGVR: "StepActionList",
+	SecretGVR:     "SecretList",
 }
 
 // NewClient returns a fake dynamic.Interface seeded with the given objects.
 // Pass *unstructured.Unstructured values built via the fixtures in this
-// package (Task, StepAction).
+// package (Task, StepAction, Secret).
 func NewClient(seed ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	scheme := runtime.NewScheme()
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(

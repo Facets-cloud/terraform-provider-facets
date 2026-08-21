@@ -3,8 +3,6 @@ package tekton
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,57 +100,101 @@ func (r *ResourceOperations) DeleteResource(ctx context.Context, namespace, name
 	return err
 }
 
-// VerifySecretKey checks that a Secret exists in the namespace and carries the
-// given key. It returns a diagnostic-quality error naming exactly what is wrong
-// and, where possible, what keys ARE present.
+// ReconcileCredentialsSecret creates or updates the Secret holding the Azure
+// service principal password, and returns nothing but an error.
 //
-// This exists so a misconfigured Secret fails at APPLY time with an actionable
-// message, rather than at action-run time with a CreateContainerConfigError that
-// the operator can only diagnose by inspecting pod events.
-func (r *ResourceOperations) VerifySecretKey(ctx context.Context, namespace, name, key string) error {
+// The provider owns this Secret rather than asking anyone to create it, because
+// the two parties who would otherwise have to agree on its name cannot talk to
+// each other: the Secret lives in the control plane's namespace, while the module
+// referencing it is configured by a customer who cannot see that namespace. The
+// name is derived from the service principal identity (see azure.DeriveSecretName),
+// so it is reproducible from data both sides already hold.
+//
+// Two properties matter for multi-account control planes:
+//
+//   - Same service principal across projects -> same derived name -> ONE Secret,
+//     shared. Applying twice is idempotent, not a conflict.
+//   - Different service principals -> different names, so no project can
+//     overwrite another's credentials.
+//
+// Ownership is deliberately NOT expressed with ownerReferences. A shared Secret
+// has many legitimate owners, and a single ownerReference would let the first
+// action's deletion garbage-collect credentials still in use by the others.
+// Instead the Secret is labelled as provider-managed and left in place; it is
+// inert without an action referencing it.
+func (r *ResourceOperations) ReconcileCredentialsSecret(ctx context.Context, namespace, name, key, clientSecret string, identity map[string]string) error {
 	gvr := k8sschema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 
-	secret, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	labels := map[string]interface{}{
+		"app.kubernetes.io/managed-by": "terraform-provider-facets",
+		"facets.cloud/credential-type": "azure-service-principal",
+	}
+	// The derived name is a hash, so carry the identity in annotations to keep the
+	// Secret traceable back to a service principal by inspection. The client
+	// secret is the only sensitive value here; tenant/client/subscription ids are
+	// not secrets and appear in plan output already.
+	annotations := map[string]interface{}{}
+	for k, v := range identity {
+		annotations["facets.cloud/"+k] = v
+	}
+
+	desired := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]interface{}{
+			"name":        name,
+			"namespace":   namespace,
+			"labels":      labels,
+			"annotations": annotations,
+		},
+		"type": "Opaque",
+		"stringData": map[string]interface{}{
+			key: clientSecret,
+		},
+	}}
+
+	existing, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			return fmt.Errorf("Secret %q not found in namespace %q. Create it before the action "+
-				"runs, e.g.:\n  kubectl create secret generic %s -n %s --from-literal=%s=<client-secret>",
-				name, namespace, name, namespace, key)
-		}
-		if k8serrors.IsForbidden(err) {
-			// Cannot verify -- do not fail the apply over a permissions gap.
+			if _, cerr := r.client.Resource(gvr).Namespace(namespace).Create(ctx, desired, metav1.CreateOptions{}); cerr != nil {
+				if k8serrors.IsAlreadyExists(cerr) {
+					// Another apply won the race for the same derived name. Same
+					// identity means the same credential, so this is success.
+					return nil
+				}
+				if k8serrors.IsForbidden(cerr) {
+					return fmt.Errorf("not permitted to create Secret %q in namespace %q: %w\n"+
+						"The provider needs create/update on secrets in that namespace, or the "+
+						"Secret must be pre-created with key %q", name, namespace, cerr, key)
+				}
+				return fmt.Errorf("could not create Secret %q in namespace %q: %w", name, namespace, cerr)
+			}
 			return nil
 		}
-		return fmt.Errorf("could not verify Secret %q in namespace %q: %w", name, namespace, err)
+		if k8serrors.IsForbidden(err) {
+			// Cannot read it to reconcile. If it already exists with the right
+			// contents the action still works, so do not fail the apply here --
+			// the failure, if any, surfaces at run time with a clear pod event.
+			return nil
+		}
+		return fmt.Errorf("could not read Secret %q in namespace %q: %w", name, namespace, err)
 	}
 
-	data, found, err := unstructuredNestedMap(secret.Object, "data")
-	if err != nil || !found {
-		return fmt.Errorf("Secret %q in namespace %q has no data", name, namespace)
-	}
-	if _, ok := data[key]; !ok {
-		present := make([]string, 0, len(data))
-		for k := range data {
-			present = append(present, k)
+	// Adopt whatever is there. A pre-existing hand-created Secret is updated in
+	// place rather than rejected, so switching to provider-managed credentials
+	// needs no manual cleanup.
+	desired.SetResourceVersion(existing.GetResourceVersion())
+	if _, uerr := r.client.Resource(gvr).Namespace(namespace).Update(ctx, desired, metav1.UpdateOptions{}); uerr != nil {
+		if k8serrors.IsForbidden(uerr) {
+			return nil
 		}
-		sort.Strings(present)
-		return fmt.Errorf("Secret %q in namespace %q has no key %q (present keys: %s). "+
-			"Either add that key or set secret_key in the provider's azure block to match",
-			name, namespace, key, strings.Join(present, ", "))
+		if k8serrors.IsConflict(uerr) {
+			// Concurrent write of the same identity's credential; converges.
+			return nil
+		}
+		return fmt.Errorf("could not update Secret %q in namespace %q: %w", name, namespace, uerr)
 	}
 	return nil
-}
-
-func unstructuredNestedMap(obj map[string]interface{}, field string) (map[string]interface{}, bool, error) {
-	v, ok := obj[field]
-	if !ok {
-		return nil, false, nil
-	}
-	m, ok := v.(map[string]interface{})
-	if !ok {
-		return nil, false, fmt.Errorf("%s is not a map", field)
-	}
-	return m, true, nil
 }
 
 // GetResource retrieves a Kubernetes resource

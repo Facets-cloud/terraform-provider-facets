@@ -25,7 +25,7 @@ func secretConfig() *azure.AzureAuthConfig {
 		ClientID:       "client-1",
 		ClientSecret:   "super-secret-value",
 		Mode:           azure.AuthModeClientSecret,
-		SecretName:     azure.DefaultCredentialsSecretName,
+		SecretName:     azure.DeriveSecretName("tenant-1", "client-1", "sub-1"),
 		SecretKey:      azure.DefaultCredentialsSecretKey,
 	}
 }
@@ -105,8 +105,8 @@ func TestBuildAzureStepAction_ClientSecret_UsesSecretKeyRef(t *testing.T) {
 		t.Fatal("env var must use valueFrom, not a literal value")
 	}
 	skr := vf["secretKeyRef"].(map[string]interface{})
-	if skr["name"] != azure.DefaultCredentialsSecretName {
-		t.Errorf("secret name = %v, want %v", skr["name"], azure.DefaultCredentialsSecretName)
+	if skr["name"] != azure.DeriveSecretName("tenant-1", "client-1", "sub-1") {
+		t.Errorf("secret name = %v", skr["name"])
 	}
 	if skr["key"] != "client_secret" {
 		t.Errorf("secret key = %v", skr["key"])
@@ -269,14 +269,4 @@ func TestGenerateAzureSecretManagerLoginScript(t *testing.T) {
 	if !strings.Contains(s, AzureConfigDir) {
 		t.Error("login step should use the shared azure config dir")
 	}
-}
-
-// Apply-time verification exists so a Secret name/key mismatch is an actionable
-// error at apply, not a CreateContainerConfigError discovered in pod events the
-// first time someone clicks the action. These assert the message quality, since
-// the whole point is that an operator with no internal knowledge can self-serve.
-func TestVerifySecretKey_MessageNamesTheProblem(t *testing.T) {
-	// Compile-time guard: the helper must stay on ResourceOperations so both the
-	// Create and Update paths can call it.
-	var _ = (*ResourceOperations).VerifySecretKey
 }
