@@ -18,6 +18,8 @@ var azureAttrTypes = map[string]attr.Type{
 	"federated_token_file": types.StringType,
 	"cloud_account_id":     types.StringType,
 	"secret_manager_path":  types.StringType,
+	"secret_name":          types.StringType,
+	"secret_key":           types.StringType,
 }
 
 // newModel builds a ProviderModel with the given azure block values. Nil values
@@ -33,6 +35,8 @@ func newModel(t *testing.T, vals map[string]attr.Value) *ProviderModel {
 		"federated_token_file": types.StringNull(),
 		"cloud_account_id":     types.StringNull(),
 		"secret_manager_path":  types.StringNull(),
+		"secret_name":          types.StringNull(),
+		"secret_key":           types.StringNull(),
 	}
 	for k, v := range vals {
 		full[k] = v
@@ -297,5 +301,40 @@ func TestGetAzureConfig_SecretManager_RejectsMixedModes(t *testing.T) {
 				t.Fatal("expected an error for mixed auth modes")
 			}
 		})
+	}
+}
+
+// The Secret name must be overridable: Tekton actions share one namespace across
+// every project on a control plane, so a fixed name would make two tenants
+// collide on one Secret.
+func TestGetAzureConfig_SecretNameDefaultsAndOverrides(t *testing.T) {
+	cfg, err := GetAzureConfig(context.Background(), validSecretModel(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SecretName != DefaultCredentialsSecretName {
+		t.Errorf("default name = %q, want %q", cfg.SecretName, DefaultCredentialsSecretName)
+	}
+	if cfg.SecretKey != DefaultCredentialsSecretKey {
+		t.Errorf("default key = %q, want %q", cfg.SecretKey, DefaultCredentialsSecretKey)
+	}
+
+	m := newModel(t, map[string]attr.Value{
+		"subscription_id": types.StringValue("sub-1"),
+		"tenant_id":       types.StringValue("tenant-1"),
+		"client_id":       types.StringValue("client-1"),
+		"client_secret":   types.StringValue("shhh"),
+		"secret_name":     types.StringValue("fourkites-azure-creds"),
+		"secret_key":      types.StringValue("azure_client_secret"),
+	})
+	cfg, err = GetAzureConfig(context.Background(), m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SecretName != "fourkites-azure-creds" {
+		t.Errorf("override name = %q", cfg.SecretName)
+	}
+	if cfg.SecretKey != "azure_client_secret" {
+		t.Errorf("override key = %q", cfg.SecretKey)
 	}
 }

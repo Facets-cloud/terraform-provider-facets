@@ -87,8 +87,8 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 				"name": "FACETS_AZURE_CLIENT_SECRET",
 				"valueFrom": map[string]interface{}{
 					"secretKeyRef": map[string]interface{}{
-						"name": AzureCredentialsSecretName,
-						"key":  "client_secret",
+						"name": azureConfig.SecretName,
+						"key":  azureConfig.SecretKey,
 					},
 				},
 			},
@@ -109,11 +109,10 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 	}, nil
 }
 
-// AzureCredentialsSecretName is the Kubernetes Secret the client-secret auth mode
-// reads from. It is created out-of-band (by the cloud_account module or a
-// bootstrap step) so the secret value never enters Terraform state for the action
-// itself, nor the Tekton Task manifest.
-const AzureCredentialsSecretName = "facets-azure-credentials"
+// The Kubernetes Secret that client-secret mode reads from is created OUT OF
+// BAND (e.g. by a k8s_resource module) -- this provider only references it, so
+// the value never appears in the rendered Task manifest. Its name and key are
+// configurable via the provider block; see azure.DefaultCredentialsSecretName.
 
 // GenerateAzureLoginScript renders the credential-setup script.
 //
@@ -185,7 +184,7 @@ fi
 	} else {
 		b.WriteString(`if [ -z "${FACETS_AZURE_CLIENT_SECRET:-}" ]; then
     echo "ERROR: FACETS_AZURE_CLIENT_SECRET is not set." >&2
-    echo "Expected it from the '` + AzureCredentialsSecretName + `' Kubernetes Secret." >&2
+    echo "Expected it from the '` + config.SecretName + `' Kubernetes Secret (key: ` + config.SecretKey + `)." >&2
     exit 1
 fi
 

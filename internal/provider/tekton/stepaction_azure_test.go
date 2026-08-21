@@ -25,6 +25,8 @@ func secretConfig() *azure.AzureAuthConfig {
 		ClientID:       "client-1",
 		ClientSecret:   "super-secret-value",
 		Mode:           azure.AuthModeClientSecret,
+		SecretName:     azure.DefaultCredentialsSecretName,
+		SecretKey:      azure.DefaultCredentialsSecretKey,
 	}
 }
 
@@ -103,8 +105,8 @@ func TestBuildAzureStepAction_ClientSecret_UsesSecretKeyRef(t *testing.T) {
 		t.Fatal("env var must use valueFrom, not a literal value")
 	}
 	skr := vf["secretKeyRef"].(map[string]interface{})
-	if skr["name"] != AzureCredentialsSecretName {
-		t.Errorf("secret name = %v, want %v", skr["name"], AzureCredentialsSecretName)
+	if skr["name"] != azure.DefaultCredentialsSecretName {
+		t.Errorf("secret name = %v, want %v", skr["name"], azure.DefaultCredentialsSecretName)
 	}
 	if skr["key"] != "client_secret" {
 		t.Errorf("secret key = %v", skr["key"])

@@ -139,6 +139,21 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 						Optional:  true,
 						Sensitive: true,
 					},
+					"secret_name": schema.StringAttribute{
+						Description: "Name of the Kubernetes Secret in the Tekton namespace holding the " +
+							"service principal secret, used by client-secret mode. Created out of band " +
+							"(e.g. by a k8s_resource module); this provider only references it, so the " +
+							"value never appears in the Task manifest. Defaults to " +
+							"\"facets-azure-credentials\". NOTE: Tekton actions share one namespace " +
+							"across all projects on a control plane, so set this per project to avoid " +
+							"two tenants colliding on one Secret.",
+						Optional: true,
+					},
+					"secret_key": schema.StringAttribute{
+						Description: "Key within secret_name holding the client secret. Defaults to " +
+							"\"client_secret\".",
+						Optional: true,
+					},
 					"use_oidc_federation": schema.BoolAttribute{
 						Description: "Authenticate by exchanging the pod's projected service-account token " +
 							"with Microsoft Entra ID instead of using a client secret. Requires a federated " +

@@ -26,6 +26,8 @@ type ProviderAzureConfig struct {
 	FederatedTokenFile types.String `tfsdk:"federated_token_file"`
 	CloudAccountID     types.String `tfsdk:"cloud_account_id"`
 	SecretManagerPath  types.String `tfsdk:"secret_manager_path"`
+	SecretName         types.String `tfsdk:"secret_name"`
+	SecretKey          types.String `tfsdk:"secret_key"`
 }
 
 // AuthMode identifies how the action pod obtains Azure credentials.
@@ -86,6 +88,16 @@ type AzureAuthConfig struct {
 	// SecretManagerPath is the secret id to read, e.g.
 	// "<cluster>/backend/accounts/<cloud_account_id>".
 	SecretManagerPath string
+
+	// SecretName is the Kubernetes Secret the client-secret mode reads from, and
+	// SecretKey the key within it. The Secret is created out of band (e.g. by a
+	// k8s_resource module) -- this provider only references it.
+	//
+	// Because Tekton actions share one namespace across every project on a
+	// control plane, leaving this at the default risks two projects with
+	// different Azure tenants colliding on the same Secret. Set it per project.
+	SecretName string
+	SecretKey  string
 }
 
 // DefaultFederatedTokenFile is where the projected service-account token is
@@ -93,6 +105,12 @@ type AzureAuthConfig struct {
 // "api://AzureADTokenExchange" -- reusing the default service-account token
 // fails with AADSTS700212 (audience mismatch).
 const DefaultFederatedTokenFile = "/var/run/secrets/azure/tokens/azure-identity-token"
+
+// Defaults for the Kubernetes Secret that client-secret mode reads from.
+const (
+	DefaultCredentialsSecretName = "facets-azure-credentials"
+	DefaultCredentialsSecretKey  = "client_secret"
+)
 
 // GetAzureConfig extracts and validates Azure configuration from provider data.
 //
@@ -199,6 +217,15 @@ func GetAzureConfig(ctx context.Context, providerModel *ProviderModel) (*AzureAu
 		mode = AuthModeOIDCFederation
 	}
 
+	secretName := DefaultCredentialsSecretName
+	if !azureConfig.SecretName.IsNull() && azureConfig.SecretName.ValueString() != "" {
+		secretName = azureConfig.SecretName.ValueString()
+	}
+	secretKey := DefaultCredentialsSecretKey
+	if !azureConfig.SecretKey.IsNull() && azureConfig.SecretKey.ValueString() != "" {
+		secretKey = azureConfig.SecretKey.ValueString()
+	}
+
 	return &AzureAuthConfig{
 		Mode:               mode,
 		SubscriptionID:     subscriptionID,
@@ -207,6 +234,8 @@ func GetAzureConfig(ctx context.Context, providerModel *ProviderModel) (*AzureAu
 		ClientSecret:       clientSecret,
 		UseOIDCFederation:  useOIDC,
 		FederatedTokenFile: tokenFile,
+		SecretName:         secretName,
+		SecretKey:          secretKey,
 	}, nil
 }
 
