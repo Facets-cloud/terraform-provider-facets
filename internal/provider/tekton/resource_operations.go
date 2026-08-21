@@ -3,6 +3,8 @@ package tekton
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -98,6 +100,59 @@ func (r *ResourceOperations) DeleteResource(ctx context.Context, namespace, name
 		return nil
 	}
 	return err
+}
+
+// VerifySecretKey checks that a Secret exists in the namespace and carries the
+// given key. It returns a diagnostic-quality error naming exactly what is wrong
+// and, where possible, what keys ARE present.
+//
+// This exists so a misconfigured Secret fails at APPLY time with an actionable
+// message, rather than at action-run time with a CreateContainerConfigError that
+// the operator can only diagnose by inspecting pod events.
+func (r *ResourceOperations) VerifySecretKey(ctx context.Context, namespace, name, key string) error {
+	gvr := k8sschema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+
+	secret, err := r.client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("Secret %q not found in namespace %q. Create it before the action "+
+				"runs, e.g.:\n  kubectl create secret generic %s -n %s --from-literal=%s=<client-secret>",
+				name, namespace, name, namespace, key)
+		}
+		if k8serrors.IsForbidden(err) {
+			// Cannot verify -- do not fail the apply over a permissions gap.
+			return nil
+		}
+		return fmt.Errorf("could not verify Secret %q in namespace %q: %w", name, namespace, err)
+	}
+
+	data, found, err := unstructuredNestedMap(secret.Object, "data")
+	if err != nil || !found {
+		return fmt.Errorf("Secret %q in namespace %q has no data", name, namespace)
+	}
+	if _, ok := data[key]; !ok {
+		present := make([]string, 0, len(data))
+		for k := range data {
+			present = append(present, k)
+		}
+		sort.Strings(present)
+		return fmt.Errorf("Secret %q in namespace %q has no key %q (present keys: %s). "+
+			"Either add that key or set secret_key in the provider's azure block to match",
+			name, namespace, key, strings.Join(present, ", "))
+	}
+	return nil
+}
+
+func unstructuredNestedMap(obj map[string]interface{}, field string) (map[string]interface{}, bool, error) {
+	v, ok := obj[field]
+	if !ok {
+		return nil, false, nil
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("%s is not a map", field)
+	}
+	return m, true, nil
 }
 
 // GetResource retrieves a Kubernetes resource

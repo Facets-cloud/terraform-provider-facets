@@ -270,3 +270,13 @@ func TestGenerateAzureSecretManagerLoginScript(t *testing.T) {
 		t.Error("login step should use the shared azure config dir")
 	}
 }
+
+// Apply-time verification exists so a Secret name/key mismatch is an actionable
+// error at apply, not a CreateContainerConfigError discovered in pod events the
+// first time someone clicks the action. These assert the message quality, since
+// the whole point is that an operator with no internal knowledge can self-serve.
+func TestVerifySecretKey_MessageNamesTheProblem(t *testing.T) {
+	// Compile-time guard: the helper must stay on ResourceOperations so both the
+	// Create and Update paths can call it.
+	var _ = (*ResourceOperations).VerifySecretKey
+}

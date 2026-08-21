@@ -381,6 +381,19 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 
+	// In client-secret mode the Secret is created out of band, so verify it now:
+	// a mismatch caught here is an actionable apply-time error, whereas the same
+	// mistake found at run time surfaces only as CreateContainerConfigError in pod
+	// events.
+	if azureConfig.Mode == azure.AuthModeClientSecret {
+		if err := operations.VerifySecretKey(
+			ctx, plan.Namespace.ValueString(), azureConfig.SecretName, azureConfig.SecretKey,
+		); err != nil {
+			resp.Diagnostics.AddError("Azure credentials Secret is not usable", err.Error())
+			return
+		}
+	}
+
 	// Create StepAction
 	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
@@ -631,6 +644,17 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 	}
 
 	// Update StepAction
+	// Same apply-time verification as Create: catch a Secret name/key mismatch here
+	// rather than letting the action fail later with CreateContainerConfigError.
+	if azureConfig.Mode == azure.AuthModeClientSecret {
+		if err := operations.VerifySecretKey(
+			ctx, plan.Namespace.ValueString(), azureConfig.SecretName, azureConfig.SecretKey,
+		); err != nil {
+			resp.Diagnostics.AddError("Azure credentials Secret is not usable", err.Error())
+			return
+		}
+	}
+
 	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
 		tektonPipelinesNamespace,
