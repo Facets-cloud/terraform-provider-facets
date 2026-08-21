@@ -230,8 +230,11 @@ func GetAzureConfig(ctx context.Context, providerModel *ProviderModel) (*AzureAu
 			"OIDC federation exchanges a projected service-account token and needs no secret")
 	}
 	if !useOIDC && clientSecret == "" {
-		return nil, fmt.Errorf("no authentication mode configured: set cloud_account_id " +
-			"(recommended), use_oidc_federation, or client_secret in the azure block")
+		return nil, fmt.Errorf("no authentication mode configured. Set client_secret in the " +
+			"azure block (the supported mode: the provider creates and manages the backing " +
+			"Kubernetes Secret for you). Alternatives: use_oidc_federation, which needs a " +
+			"federated credential registered in Entra, or cloud_account_id, which resolves " +
+			"credentials from the control plane's secret manager")
 	}
 
 	tokenFile := DefaultFederatedTokenFile

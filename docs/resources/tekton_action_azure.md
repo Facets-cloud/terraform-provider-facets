@@ -18,7 +18,43 @@ removes the trade-off.
 
 ## Authentication modes
 
-### Secret manager (recommended)
+There is no `mode` argument. The mode follows from **which fields you set**, checked
+in this order:
+
+| Fields set in the `azure` block | Mode |
+|---|---|
+| `client_secret` (with `subscription_id`, `tenant_id`, `client_id`) | **Client secret** — the supported mode |
+| `use_oidc_federation = true` (with the three ids, no `client_secret`) | OIDC federation |
+| `cloud_account_id` alone | Secrets Manager |
+| none of the above | **error** — the apply fails, no mode is assumed |
+
+The modes are mutually exclusive and the provider rejects combinations rather than
+guessing: `cloud_account_id` with either of the others, or `client_secret` together
+with `use_oidc_federation`, is an error naming the conflict.
+
+> **Which one to use:** set `client_secret`. That is the mode this resource is
+> deployed with today, and the only one exercised end to end against a live control
+> plane. OIDC federation is the intended end state — it removes the standing secret
+> entirely — but it needs a federated credential registered in Entra and a Tekton
+> `config-defaults` change first. Secrets Manager mode works but is not in use.
+
+### Client secret (the supported mode)
+
+```hcl
+provider "facets" {
+  azure = {
+    subscription_id = "..."
+    tenant_id       = "..."
+    client_id       = "..."
+    client_secret   = var.client_secret
+  }
+}
+```
+
+Nothing else to configure — see [How the Secret is named](#how-the-secret-is-named)
+below for what the provider does on your behalf.
+
+### Secret manager
 
 The action resolves the credentials at run time from the control plane's secret
 store, using the pod's own cloud identity (IRSA on an EKS-hosted control plane).
@@ -56,7 +92,7 @@ Requires the action pod's service account to be authorised for
 `secretsmanager:GetSecretValue` — which the Facets release-pod IRSA role already
 grants.
 
-### OIDC federation (preferred)
+### OIDC federation
 
 Microsoft Entra ID exchanges the pod's projected service-account token for an Azure
 token, so **no client secret exists anywhere**. This is the Azure analogue of AWS
@@ -88,42 +124,35 @@ For AKS, enable `oidc_issuer_enabled` and `workload_identity_enabled` on the
 cluster. For EKS/GKE, the cluster's OIDC issuer URL is used directly — Entra ID
 accepts any OIDC issuer.
 
-> **Status: requires a control-plane change.** Verified against a live action run:
-> the control plane creates TaskRuns with a fixed `serviceAccountName`
-> (`facets-actions-sa`) and `podTemplate: null`, so an action cannot request its
-> own projected volume. The pod *does* already receive a projected token — the
-> EKS pod-identity webhook injects one because that ServiceAccount carries an
-> `eks.amazonaws.com/role-arn` annotation — but its audience is
-> `sts.amazonaws.com`, not `api://AzureADTokenExchange`, so Entra rejects it with
+> **Status: not yet usable — needs cluster setup, but no control-plane code change.**
+>
+> The pod already receives a projected token (the EKS pod-identity webhook injects
+> one because `facets-actions-sa` carries an `eks.amazonaws.com/role-arn`
+> annotation), but its audience is `sts.amazonaws.com`, so Entra rejects it with
 > `AADSTS700212`.
 >
-> Two possible fixes, both control-plane side:
-> 1. Add a second projected token with audience `api://AzureADTokenExchange` to
->    the TaskRun pod template (additive; does not disturb the existing AWS token).
-> 2. Let the action declare a service account / pod template, so an
->    Azure-federated ServiceAccount can be used.
+> Two prerequisites, neither in application code:
+> 1. A federated identity credential on the app registration. Without it Entra
+>    returns `AADSTS70025`; with a wrong audience, `AADSTS700212`. Both were
+>    observed, confirming Entra accepts the token's issuer.
+> 2. A second projected token with audience `api://AzureADTokenExchange`. Tekton's
+>    `config-defaults` ConfigMap supports `default-pod-template`, which is
+>    currently unset — so this is a ConfigMap key, additive, leaving the existing
+>    AWS token untouched.
 >
-> Until then, use **client secret** mode, which needs no control-plane change.
+> An earlier revision of this page claimed a control-plane code change was needed.
+> That was wrong: `TektonTaskService.java:342-378` sets only name, annotations,
+> taskRef and params — never `serviceAccountName` or `podTemplate`.
+> `facets-actions-sa` comes from the ConfigMap above.
 
-### Client secret
+### How the Secret is named
 
-```hcl
-provider "facets" {
-  azure = {
-    subscription_id = "..."
-    tenant_id       = "..."
-    client_id       = "..."
-    client_secret   = var.client_secret
-  }
-}
-```
+Applies to client-secret mode.
 
-Nothing else is required: the provider creates and maintains the Kubernetes Secret
-that backs this, and the action reads it at pod start via `secretKeyRef`, so the
-password never appears in the rendered `Task` or `StepAction` manifest. Provider
-configuration is not written to Terraform state.
-
-#### How the Secret is named
+The provider creates and maintains the Kubernetes Secret that backs it, and the
+action reads it at pod start via `secretKeyRef`, so the password never appears in the
+rendered `Task` or `StepAction` manifest. Provider configuration is not written to
+Terraform state.
 
 The name is derived from the service principal identity:
 
