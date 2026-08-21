@@ -40,3 +40,6 @@ references/
 
 # Claude
 .claude/
+
+# Module download artifacts (raptor module download) must never be committed here
+*.zip
