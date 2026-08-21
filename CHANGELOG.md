@@ -8,25 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`facets_tekton_action_azure`** — first-class Azure action type, so Azure actions get the same one-click experience AWS actions already have. Credentials are configured once in the provider `azure` block and injected by a prepended `setup-credentials` step; the user triggering the action never supplies them.
-  - **OIDC federation mode** (`use_oidc_federation = true`) — Microsoft Entra ID exchanges the pod's projected service-account token for an Azure token, so **no client secret exists anywhere**. The Azure analogue of the AWS variant's IRSA flow, and it works cross-cloud: a pod in an EKS control-plane cluster can authenticate to Azure. Requires a federated identity credential trusting the cluster's OIDC issuer with audience `api://AzureADTokenExchange`.
-  - **Client secret mode** — the provider creates and maintains the backing Kubernetes Secret itself, named `facets-azure-creds-<hash of tenant|client|subscription>`. The action reads it via `secretKeyRef`, so the value never appears in the rendered Task or StepAction manifest. Deriving the name means no one has to be told it, and service principals cannot collide on a shared control plane. `secret_name`/`secret_key` remain available to pin an existing Secret.
-  - Setting both `client_secret` and `use_oidc_federation`, or neither, is rejected with a clear diagnostic.
+- **`facets_tekton_action_azure`** — first-class Azure action type, giving Azure actions the same one-click experience AWS actions already have via IRSA. Credentials are configured once in the provider's `azure` block; a prepended `setup-credentials` step runs `az login`, so user steps start already authenticated and the person triggering the action never supplies credentials.
+
+  Configuration is the service principal and nothing else:
+
+  ```hcl
+  provider "facets" {
+    azure = {
+      subscription_id = "..."
+      tenant_id       = "..."
+      client_id       = "..."
+      client_secret   = "..."
+    }
+  }
+  ```
+
+  - **The provider creates and maintains the Kubernetes Secret** holding the password, and the action reads it via `secretKeyRef`. The value appears in neither Terraform state (provider configuration is not persisted there) nor the rendered `Task`/`StepAction` manifests.
+  - **The Secret's name is derived from the service principal identity** — `facets-azure-creds-<sha256(tenant|client|subscription)[:16]>`. This is what makes the flow work without coordination: the Secret lives in the control plane's namespace, while the module referencing it is configured by someone who cannot see that namespace, so a name typed in one place could never be looked up in the other. Both sides compute it independently from values they already hold.
+  - **Multi-account safe.** Actions sharing a service principal share one Secret and reconcile idempotently; different service principals derive different names, so no project can overwrite another's credentials. A fixed name would have allowed exactly that.
+  - **Rotation converges.** A changed password is picked up on the next plan or refresh, since reconciliation also happens in `Read` — changing only provider configuration moves no resource attribute, so Terraform would otherwise report "No changes" and leave the old credential in place.
+  - The Secret carries no `ownerReferences`, deliberately: a shared Secret has several legitimate owners, and one action's deletion must not garbage-collect credentials another action still uses. It is labelled `app.kubernetes.io/managed-by=terraform-provider-facets` and annotated with the tenant, client and subscription ids so the hashed name stays traceable.
+  - `secret_name` / `secret_key` are available to pin a specific name, but neither is required.
   - Injects `AZURE_CONFIG_DIR` into user steps, mirroring how the AWS variant injects `AWS_CONFIG_FILE`.
   - Uses `mcr.microsoft.com/azure-cli:2.61.0` for the credential-setup step. `facetscloud/actions-base-image:v1.0.0` bundles `awscli` and `kubectl` but has **no `az` CLI** (verified against the published image), so `az login` would fail there.
-  - 19 unit tests covering config validation (both auth modes, mutual exclusivity, required/empty fields) and script generation (no secret inlined, correct flags per mode, missing-token guard).
 
-### Added (follow-up)
-- **Secret-manager auth mode (`cloud_account_id` + `secret_manager_path`) — now the recommended path.** The action resolves the Azure credentials at run time from the control plane's secret store using the pod's own cloud identity (IRSA), so the blueprint holds only a cloud-account id. **No secret in Terraform state, none in the Task manifest, no Kubernetes Secret to create, and no per-cluster setup.** Reuses the secret layout the `cloud_account` modules already read. Generates a fetch step on the base image (which has `aws`) plus an `az login` step on the azure-cli image, since neither image has both tools; credentials are shredded after login. Verified end to end against a live control-plane cluster: authenticated and queried a real Azure MySQL Flexible Server with no Kubernetes Secret present.
-
-### Known limitation
-`use_oidc_federation` needs a control-plane change before it can be used. Verified against a live action run: the CP creates TaskRuns with a fixed `serviceAccountName` (`facets-actions-sa`) and `podTemplate: null`, so an action cannot request its own projected volume. The pod already receives a projected token (the EKS pod-identity webhook injects one for the `eks.amazonaws.com/role-arn` annotation), but its audience is `sts.amazonaws.com` rather than `api://AzureADTokenExchange`, so Entra rejects it with `AADSTS700212`. Fix is additive on the CP side — project a second token with the Azure audience, or let actions declare a service account / pod template. **Client-secret mode works today with no CP change.**
+### Fixed
+- **An action name containing a space failed the entire apply.** `display_name` was written to a Kubernetes label unmodified, so a name like `"Stop Database"` produced `metadata.labels: Invalid value`. Label values are now sanitized to `[A-Za-z0-9._-]`, trimmed to 63 characters and required to begin and end alphanumeric, asserted against Kubernetes' own `validation.IsValidLabelValue`. **This affected all three action types** (`_aws`, `_kubernetes`, `_azure`) and predates this resource.
 
 ### Why
-Before this change the only way to run `az` from an action was `facets_tekton_action_kubernetes` with credentials as Tekton params, forcing a human to paste a client secret on every run. The alternative — interpolating the secret into the step `script`/`env` — persists it in **both** Terraform state and the in-cluster Task manifest, because nothing in this provider is marked `Sensitive` and step `env` accepts only literal values. This resource removes that trade-off.
+Before this change the only way to run `az` from an action was `facets_tekton_action_kubernetes` with credentials passed as Tekton params, forcing a human to paste a client secret on every run. The alternative — interpolating the secret into the step `script`/`env` — persists it in **both** Terraform state and the in-cluster `Task` manifest, because nothing in this provider is marked `Sensitive` and step `env` accepts only literal values. This resource removes that trade-off.
+
+### Notes on scope
+Earlier revisions of this branch also implemented OIDC federation (`use_oidc_federation`) and control-plane secret-manager resolution (`cloud_account_id`), selected by the *presence* of a field. Both were removed before release.
+
+A mode chosen that way can be switched by accident — these fields can be populated by an output-type mapping on a `cloud_account` module, so a single wrong mapping would change authentication for every project using that account. And a lone `use_oidc_federation = true` was indistinguishable from a deliberate choice: it applied cleanly and failed only when a user clicked the action, with `federated token not found`. Shipping three modes to serve one meant carrying that failure class for no benefit.
+
+OIDC federation remains the better end state, since it removes the standing secret entirely. It needs a federated identity credential in Entra plus a Tekton `default-pod-template` projecting audience `api://AzureADTokenExchange` — cluster configuration, not control-plane application code. The implementation is preserved in git history if revisited.
 
 ### Compatibility
-No changes to `facets_tekton_action_aws` or `facets_tekton_action_kubernetes`. No schema changes to existing resources. All existing tests pass unchanged.
+No changes to `facets_tekton_action_aws` or `facets_tekton_action_kubernetes` beyond the `display_name` label fix above, which turns a previously failing configuration into a working one. No schema changes to existing resources.
 
 ## [1.2.1] - 2026-05-14
 
