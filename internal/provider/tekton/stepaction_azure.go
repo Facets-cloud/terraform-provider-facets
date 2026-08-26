@@ -106,14 +106,34 @@ func GenerateAzureLoginScript(config *azure.AzureAuthConfig) string {
 fi
 
 `)
-	b.WriteString(fmt.Sprintf(`az login --service-principal \
+	// Progress output matters here. Every command on the success path is otherwise
+	// silent (mkdir, the guard, `az login --output none`, `az account set`), so a
+	// working step produced a COMPLETELY EMPTY log -- indistinguishable from a step
+	// that never ran. Whoever clicks the action has no other signal, so say what is
+	// happening and confirm the identity afterwards.
+	b.WriteString(fmt.Sprintf(`echo "Authenticating to Azure as service principal %s"
+echo "  tenant:       %s"
+echo "  subscription: %s"
+
+az login --service-principal \
   --username %q \
   --password "$FACETS_AZURE_CLIENT_SECRET" \
   --tenant %q \
   --output none
-`, config.ClientID, config.TenantID))
 
-	b.WriteString(fmt.Sprintf("\naz account set --subscription %q\n", config.SubscriptionID))
+echo "Login succeeded."
+`, config.ClientID, config.TenantID, config.SubscriptionID, config.ClientID, config.TenantID))
+
+	b.WriteString(fmt.Sprintf(`
+az account set --subscription %q
+echo "Active subscription set to %s"
+
+# Echo back what Azure thinks we are, so an authorization failure in a LATER step
+# can be told apart from a wrong-identity problem here.
+az account show --query "{subscriptionId:id, tenantId:tenantId, identity:user.name, type:user.type}" -o json
+
+echo "Azure CLI profile written to $AZURE_CONFIG_DIR -- later steps inherit it."
+`, config.SubscriptionID, config.SubscriptionID))
 
 	return b.String()
 }
