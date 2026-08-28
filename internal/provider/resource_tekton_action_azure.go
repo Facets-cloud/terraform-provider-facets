@@ -10,6 +10,7 @@ import (
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -822,6 +823,22 @@ func (r *TektonActionAzureResource) deleteResources(ctx context.Context, operati
 	return diags
 }
 
+// schemaAttrElemType returns the element type the SCHEMA declares for a list
+// attribute. Derived rather than hand-written so it cannot drift from the schema
+// as steps/params gain fields.
+func schemaAttrElemType(r *TektonActionAzureResource, name string) attr.Type {
+	var resp resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &resp)
+	if a, ok := resp.Schema.Attributes[name]; ok {
+		if lt, ok := a.GetType().(types.ListType); ok {
+			return lt.ElementType()
+		}
+	}
+	// Unreachable for the current schema; a bare object keeps the null typed
+	// rather than panicking if the attribute is ever restructured.
+	return types.ObjectType{}
+}
+
 func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Import format: taskName or namespace/taskName.
 	// Example: 59f6f855860ddc99a32e2944c96db5fa
@@ -903,6 +920,25 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 		// unset makes it unknown in state, and because it carries RequiresReplace
 		// the next plan would want to destroy and recreate the imported action.
 		Namespace: types.StringValue(importNS),
+
+		// The object- and list-typed attributes MUST carry their element types even
+		// when null. A zero-value types.Object has no attribute types, which the
+		// framework rejects: "Value Conversion Error ... Received framework type
+		// types.ObjectType[]". That made `terraform import` fail outright for this
+		// resource type -- a pre-existing bug, surfaced once the namespace fix let
+		// import get far enough to reach the type check.
+		//
+		// These cannot be reconstructed from the Task, so they are TYPED nulls; the
+		// operator supplies them in configuration and the next plan reconciles.
+		FacetsEnvironment: types.ObjectNull(map[string]attr.Type{
+			"unique_name": types.StringType,
+		}),
+		FacetsResource: types.ObjectNull(map[string]attr.Type{
+			"kind": types.StringType,
+		}),
+		Labels: types.MapNull(types.StringType),
+		Steps:  types.ListNull(schemaAttrElemType(r, "steps")),
+		Params: types.ListNull(schemaAttrElemType(r, "params")),
 	}
 
 	// Note: We cannot fully reconstruct facets_environment, facets_resource, steps, params from the Task
