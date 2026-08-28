@@ -1,10 +1,13 @@
 package tekton
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -103,35 +106,58 @@ var labelInvalidChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 // sanitizeLabelValue coerces an arbitrary string into a valid Kubernetes label
 // value: at most 63 characters of [A-Za-z0-9._-], beginning and ending with an
-// alphanumeric.
+// alphanumeric, and NEVER empty for a non-empty input.
 //
-// display_name is a human-facing string -- "Stop Database", "Restart & Verify" --
-// and Kubernetes rejects the space, so passing it through unmodified made the whole
-// apply fail with `metadata.labels: Invalid value`. The action name is chosen by
-// whoever writes the module, so the provider cannot assume it is label-safe.
+// These values are human-facing strings -- "Stop Database", "Restart & Verify" --
+// and Kubernetes rejects the space, so passing them through unmodified made the
+// whole apply fail with `metadata.labels: Invalid value`. Names are chosen by
+// whoever writes the module, so the provider cannot assume they are label-safe.
 //
-// Labels are used to correlate Tekton objects back to a resource, so a lossy but
-// deterministic transformation is fine here; the exact display name is preserved on
-// the Task spec itself, not in this label.
+// The awkward case is a value with NO label-safe characters at all: CJK, Cyrillic,
+// emoji, or pure punctuation. Stripping those yields "" -- a technically valid
+// label, but it collapses distinct actions onto one indistinguishable value, so
+// "データベース停止" and "データベース開始" became the same label. When that happens,
+// fall back to a short content hash so the label stays unique and stable. The exact
+// original is preserved in the facets.cloud/display-name annotation, which has no
+// charset restriction.
 func sanitizeLabelValue(v string) string {
-	v = labelInvalidChars.ReplaceAllString(v, "-")
+	if v == "" {
+		return ""
+	}
+
+	out := labelInvalidChars.ReplaceAllString(v, "-")
 
 	// Collapse runs of separators so "Stop  &  Start" does not become "Stop---Start".
-	for strings.Contains(v, "--") {
-		v = strings.ReplaceAll(v, "--", "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
 	}
 
-	if len(v) > 63 {
-		v = v[:63]
-	}
+	out = truncateLabel(out)
 
-	// Must begin and end alphanumeric. Trimming can empty the string entirely (e.g.
-	// a name of only punctuation), which is itself a valid label value.
-	v = strings.Trim(v, "-._")
-	if len(v) > 63 {
-		v = v[:63]
+	// Must begin and end alphanumeric.
+	out = strings.Trim(out, "-._")
+	out = truncateLabel(out)
+
+	// Nothing label-safe survived. Derive a deterministic, unique value from the
+	// original rather than returning "" and colliding with every other such name.
+	if out == "" {
+		sum := sha256.Sum256([]byte(v))
+		return "x-" + hex.EncodeToString(sum[:])[:16]
 	}
-	return v
+	return out
+}
+
+// truncateLabel cuts to the 63-character limit on a RUNE boundary. Slicing bytes
+// can split a multi-byte character and leave an invalid trailing fragment.
+func truncateLabel(v string) string {
+	if len(v) <= 63 {
+		return v
+	}
+	trimmed := v[:63]
+	for len(trimmed) > 0 && !utf8.ValidString(trimmed) {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed
 }
 
 func formatBool(b bool) string {

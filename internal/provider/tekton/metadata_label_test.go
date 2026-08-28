@@ -3,6 +3,7 @@ package tekton
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -104,6 +105,69 @@ func TestLabels_EveryValueIsSanitized(t *testing.T) {
 	for k, v := range m.Labels() {
 		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
 			t.Errorf("label %s=%q not sanitized: %v", k, v, errs)
+		}
+	}
+}
+
+// A value with NO label-safe characters (CJK, Cyrillic, emoji, pure punctuation)
+// stripped to "" -- technically a valid label, but it collapsed every such name
+// onto one indistinguishable value: "データベース停止" and "データベース開始" produced
+// the SAME label, so two different actions on one resource became
+// indistinguishable. Non-empty input must now yield a non-empty, unique label.
+func TestLabels_NonASCIINamesDoNotCollapse(t *testing.T) {
+	names := []string{
+		"データベース停止",      // stop database (ja)
+		"データベース開始",      // start database (ja)
+		"Остановить БД", // stop db (ru)
+		"停止",            // stop (zh)
+		"開始",            // start (zh)
+		"...",
+		"---",
+		"   ",
+		"🛑",
+		"▶",
+	}
+
+	seen := map[string]string{}
+	for _, n := range names {
+		got := sanitizeLabelValue(n)
+
+		if got == "" {
+			t.Errorf("%q sanitized to the empty string", n)
+			continue
+		}
+		if errs := validation.IsValidLabelValue(got); len(errs) > 0 {
+			t.Errorf("%q -> %q is not a valid label: %v", n, got, errs)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Errorf("COLLISION: %q and %q both -> %q", prev, n, got)
+		}
+		seen[got] = n
+
+		// Deterministic: the same input must always give the same label.
+		if again := sanitizeLabelValue(n); again != got {
+			t.Errorf("%q is not deterministic: %q then %q", n, got, again)
+		}
+	}
+}
+
+// Truncation must not split a multi-byte character, which would leave an invalid
+// trailing fragment in the label.
+func TestLabels_TruncationRespectsRuneBoundaries(t *testing.T) {
+	for _, n := range []string{
+		strings.Repeat("a-ü", 40),
+		strings.Repeat("Ünïcödé ", 20),
+		strings.Repeat("x", 200),
+	} {
+		got := sanitizeLabelValue(n)
+		if len(got) > 63 {
+			t.Errorf("label too long (%d): %q", len(got), got)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("truncation produced invalid UTF-8: %q", got)
+		}
+		if errs := validation.IsValidLabelValue(got); len(errs) > 0 {
+			t.Errorf("%q -> %q invalid: %v", n[:12], got, errs)
 		}
 	}
 }
