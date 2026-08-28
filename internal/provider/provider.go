@@ -17,7 +17,17 @@ type FacetsProvider struct {
 }
 
 type FacetsProviderModel struct {
-	AWS types.Object `tfsdk:"aws"`
+	AWS   types.Object `tfsdk:"aws"`
+	Azure types.Object `tfsdk:"azure"`
+}
+
+type ProviderAzureConfig struct {
+	SubscriptionID types.String `tfsdk:"subscription_id"`
+	TenantID       types.String `tfsdk:"tenant_id"`
+	ClientID       types.String `tfsdk:"client_id"`
+	ClientSecret   types.String `tfsdk:"client_secret"`
+	SecretName     types.String `tfsdk:"secret_name"`
+	SecretKey      types.String `tfsdk:"secret_key"`
 }
 
 type ProviderAWSConfig struct {
@@ -79,6 +89,50 @@ func (p *FacetsProvider) Schema(ctx context.Context, req provider.SchemaRequest,
 					},
 				},
 			},
+			"azure": schema.SingleNestedAttribute{
+				Description: "Azure configuration for facets_tekton_action_azure resources. " +
+					"Optional; only required when using Azure actions. Supply the service " +
+					"principal that owns the target resources: the provider creates and " +
+					"maintains the Kubernetes Secret holding its password, and the action reads " +
+					"that Secret via secretKeyRef at pod start. The user triggering the action " +
+					"never supplies credentials, and the password appears in neither Terraform " +
+					"state nor the rendered Tekton manifests.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"subscription_id": schema.StringAttribute{
+						Description: "Azure subscription ID that owns the target resources.",
+						Optional:    true,
+					},
+					"tenant_id": schema.StringAttribute{
+						Description: "Microsoft Entra ID (Azure AD) tenant ID.",
+						Optional:    true,
+					},
+					"client_id": schema.StringAttribute{
+						Description: "Application (client) ID of the service principal.",
+						Optional:    true,
+					},
+					"client_secret": schema.StringAttribute{
+						Description: "Service principal client secret. Provider configuration is not " +
+							"persisted in Terraform state; the value is written to a Kubernetes Secret " +
+							"that the provider manages and the action consumes via secretKeyRef.",
+						Optional:  true,
+						Sensitive: true,
+					},
+					"secret_name": schema.StringAttribute{
+						Description: "OPTIONAL override for the name of the managed Kubernetes Secret. " +
+							"Normally omit this: the name is derived from the service principal " +
+							"identity (tenant + client + subscription), so it needs no coordination " +
+							"between whoever operates the control plane and whoever configures the " +
+							"module, and two different service principals cannot collide.",
+						Optional: true,
+					},
+					"secret_key": schema.StringAttribute{
+						Description: "OPTIONAL override for the key within the managed Secret. " +
+							"Defaults to \"client_secret\".",
+						Optional: true,
+					},
+				},
+			},
 		},
 	}
 }
@@ -101,6 +155,7 @@ func (p *FacetsProvider) Resources(ctx context.Context) []func() resource.Resour
 	return []func() resource.Resource{
 		NewTektonActionKubernetesResource,
 		NewTektonActionAWSResource,
+		NewTektonActionAzureResource,
 	}
 }
 

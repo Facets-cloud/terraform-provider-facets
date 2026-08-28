@@ -110,7 +110,8 @@ func TestDeleteResource_Success(t *testing.T) {
 // `if k8serrors.IsNotFound(err) { return nil }` in the Delete path).
 //
 // See: https://github.com/Facets-cloud/terraform-provider-facets/issues/11
-//      RCA at ~/.flow/tasks/mis-tekton-leak/updates/2026-05-06-rca.md §3.4
+//
+//	RCA at ~/.flow/tasks/mis-tekton-leak/updates/2026-05-06-rca.md §3.4
 func TestDeleteResource_NotFound_IdempotentReturnsNil(t *testing.T) {
 	c := testfake.NewClient() // empty — object not present
 	ops := NewResourceOperations(c)

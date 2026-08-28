@@ -100,7 +100,8 @@ func TestK8sReadResourceState_TaskNotFound_RemoveFromState(t *testing.T) {
 // Passes once issue #9 fix lands.
 //
 // See: https://github.com/Facets-cloud/terraform-provider-facets/issues/9
-//      RCA §9.1 (broader-framing reframe)
+//
+//	RCA §9.1 (broader-framing reframe)
 func TestK8sReadResourceState_TaskGet503_StateRetainedAndErrorSurfaced(t *testing.T) {
 	task := testfake.Task(k8sReadTestNamespace, k8sReadTestTaskName, nil)
 	r, c := resourceWithFake(task)

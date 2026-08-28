@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 
+	"github.com/facets-cloud/terraform-provider-facets/internal/azure"
 	"github.com/facets-cloud/terraform-provider-facets/internal/k8s"
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -24,28 +27,33 @@ import (
 )
 
 var (
-	_ resource.Resource                = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithConfigure   = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithImportState = &TektonActionKubernetesResource{}
+	_ resource.Resource                = &TektonActionAzureResource{}
+	_ resource.ResourceWithConfigure   = &TektonActionAzureResource{}
+	_ resource.ResourceWithImportState = &TektonActionAzureResource{}
 )
 
-func NewTektonActionKubernetesResource() resource.Resource {
-	return &TektonActionKubernetesResource{
+// NewTektonActionAzureResource creates a new Azure action resource
+func NewTektonActionAzureResource() resource.Resource {
+	return &TektonActionAzureResource{
 		clientFactory: k8s.GetKubernetesClient,
 	}
 }
 
-type TektonActionKubernetesResource struct {
+// TektonActionAzureResource manages Tekton Tasks and StepActions for Azure workflows
+type TektonActionAzureResource struct {
+	providerData *FacetsProviderModel
 	// No cached client - fresh client created per operation for thread safety.
 	//
 	// clientFactory produces a Kubernetes dynamic client. Defaults to
-	// k8s.GetKubernetesClient in production via NewTektonActionKubernetesResource.
+	// k8s.GetKubernetesClient in production via NewTektonActionAzureResource.
 	// Tests in the same package may override this field directly to inject a
 	// fake client. Do not access from outside the provider package.
 	clientFactory func() (dynamic.Interface, error)
 }
 
-type TektonActionKubernetesResourceModel struct {
+// TektonActionAzureResourceModel represents the resource data model
+// This is identical to the Kubernetes action model since the schema is the same
+type TektonActionAzureResourceModel struct {
 	ID                 types.String `tfsdk:"id"`
 	Name               types.String `tfsdk:"name"`
 	Description        types.String `tfsdk:"description"`
@@ -60,16 +68,16 @@ type TektonActionKubernetesResourceModel struct {
 	StepActionName     types.String `tfsdk:"step_action_name"`
 }
 
-func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_tekton_action_kubernetes"
+func (r *TektonActionAzureResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_tekton_action_azure"
 }
 
-func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *TektonActionAzureResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages a Tekton Task and StepAction for Kubernetes-based workflows. " +
-			"This resource automatically injects Kubernetes credentials (FACETS_USER_KUBECONFIG) " +
-			"via a setup-credentials step, which is populated by the Facets UI when users run actions. " +
-			"The kubeconfig is scoped to the user's RBAC permissions.",
+		Description: "Manages a Tekton Task and StepAction for Azure-based workflows. " +
+			"This resource automatically injects Azure credentials (configured at provider level) " +
+			"via a setup-credentials step, which runs 'az login' and writes an Azure CLI profile. " +
+			"Users triggering the action never supply credentials.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Resource identifier",
@@ -238,17 +246,34 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 				Computed: true,
 			},
 			"step_action_name": schema.StringAttribute{
-				Description: "Generated StepAction name for credential setup (computed from hash). " +
-					"This StepAction automatically configures Kubernetes access for the workflow steps.",
+				Description: "Generated StepAction name for Azure credential setup (computed from hash). " +
+					"This StepAction runs 'az login' as the configured service principal and writes " +
+					"an Azure CLI profile that the workflow steps inherit.",
 				Computed: true,
 			},
 		},
 	}
 }
 
-func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+func (r *TektonActionAzureResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	// Client will be created lazily when needed during CRUD operations.
 	// This allows terraform validate to pass without requiring a kubeconfig.
+
+	// Store provider data for accessing the Azure config during Create/Update.
+	// Validation is lazy -- done during CRUD, not here -- so `terraform validate`
+	// succeeds without Azure credentials present.
+	if req.ProviderData != nil {
+		// Type assert to get provider model
+		providerModel, ok := req.ProviderData.(*FacetsProviderModel)
+		if !ok {
+			resp.Diagnostics.AddError(
+				"Unexpected Provider Data Type",
+				fmt.Sprintf("Expected *FacetsProviderModel, got: %T", req.ProviderData),
+			)
+			return
+		}
+		r.providerData = providerModel
+	}
 }
 
 // getClient returns a fresh Kubernetes client and operations for each call.
@@ -256,14 +281,14 @@ func (r *TektonActionKubernetesResource) Configure(ctx context.Context, req reso
 // thread-safe, and avoids stale client issues.
 //
 // In production, clientFactory is k8s.GetKubernetesClient (set by
-// NewTektonActionKubernetesResource). In tests, the field can be overridden
-// to inject a fake dynamic.Interface for unit-testing CRUD lifecycle paths.
-func (r *TektonActionKubernetesResource) getClient() (dynamic.Interface, *tekton.ResourceOperations, error) {
+// NewTektonActionAzureResource). In tests, the field can be overridden to
+// inject a fake dynamic.Interface for unit-testing CRUD lifecycle paths.
+func (r *TektonActionAzureResource) getClient() (dynamic.Interface, *tekton.ResourceOperations, error) {
 	factory := r.clientFactory
 	if factory == nil {
 		// Safety net: a zero-valued struct (e.g. constructed without
-		// NewTektonActionKubernetesResource) still produces a real client
-		// rather than panicking with a nil-pointer dereference.
+		// NewTektonActionAzureResource) still produces a real client rather
+		// than panicking with a nil-pointer dereference.
 		factory = k8s.GetKubernetesClient
 	}
 	client, err := factory()
@@ -273,8 +298,8 @@ func (r *TektonActionKubernetesResource) getClient() (dynamic.Interface, *tekton
 	return client, tekton.NewResourceOperations(client), nil
 }
 
-func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var plan TektonActionKubernetesResourceModel
+func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan TektonActionAzureResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -289,11 +314,6 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 			err.Error(),
 		)
 		return
-	}
-
-	// Set defaults
-	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
-		plan.Namespace = types.StringValue("tekton-pipelines")
 	}
 
 	// Extract environment unique_name from environment object
@@ -318,9 +338,16 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	)
 	plan.TaskName = types.StringValue(names.TaskName)
 	plan.StepActionName = types.StringValue(names.StepActionName)
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", plan.Namespace.ValueString(), names.TaskName))
+	// Resolve the namespace BEFORE anything derives from it. A StepAction is only
+	// resolvable from a TaskRun in the same namespace, so the Task, StepAction,
+	// Secret, the ID and every later Read/Delete must all agree on this one value.
+	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
+		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
+	}
+	ns := plan.Namespace.ValueString()
 
-	// Extract custom labels
+	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", ns, names.TaskName))
+
 	customLabels := make(map[string]string)
 	if !plan.Labels.IsNull() {
 		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
@@ -329,25 +356,75 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 		}
 	}
 
-	// Create metadata
 	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		false, // cloud_action: false for Kubernetes actions
-		customLabels,
+		true,         // cloud_action: true for Azure actions
+		customLabels, // customLabels: not supported for Azure actions yet
 	)
 
-	// Build StepAction
-	stepAction := tekton.BuildKubernetesStepAction(
+	// Validate provider data is available
+	if r.providerData == nil {
+		resp.Diagnostics.AddError(
+			"Provider Configuration Error",
+			"Provider data is not configured. Ensure the provider block is properly configured.",
+		)
+		return
+	}
+
+	// Get the Azure config from the provider block
+	azureProviderModel := &azure.ProviderModel{
+		Azure: r.providerData.Azure,
+	}
+	azureConfig, err := azure.GetAzureConfig(ctx, azureProviderModel)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Azure Configuration Error",
+			err.Error(),
+		)
+		return
+	}
+
+	// The provider owns the credentials Secret in client-secret mode. Creating it
+	// here -- rather than requiring it out of band -- is what lets the derived name
+	// stay an implementation detail: nobody has to be told a name, because nobody
+	// has to type one. See ReconcileCredentialsSecret for why the Secret is shared
+	// rather than owned by a single action.
+	// Unconditional: client-secret is the only auth mode, so there is nothing to
+	// branch on. A `Mode ==` guard here would read as a live check that can fail.
+	{
+		if err := operations.ReconcileCredentialsSecret(
+			ctx, plan.Namespace.ValueString(),
+			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+			map[string]string{
+				"tenant-id":       azureConfig.TenantID,
+				"client-id":       azureConfig.ClientID,
+				"subscription-id": azureConfig.SubscriptionID,
+			},
+		); err != nil {
+			resp.Diagnostics.AddError("Could not provision the Azure credentials Secret", err.Error())
+			return
+		}
+	}
+
+	// Create StepAction
+	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
-		plan.Namespace.ValueString(),
+		ns,
 		metadata.LabelsAsInterface(),
+		azureConfig,
 	)
-
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error building StepAction",
+			fmt.Sprintf("Could not build StepAction: %s", err.Error()),
+		)
+		return
+	}
 	// Build Task
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -360,16 +437,14 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-// createResources creates the StepAction and Task in cluster. Returns
-// diagnostics. Extracted from Create so unit tests can exercise the
-// orphan-on-Task-fail path with a fake dynamic client.
+// createResources creates the StepAction and Task in cluster. Mirrors the K8s variant.
 //
-// Fix for issue #10 / Bug #1: if Task creation fails after StepAction
-// creation succeeded, the StepAction is rolled back via DeleteResource
-// (which is idempotent on NotFound per fix #11). If rollback itself fails,
-// a warning is surfaced alongside the original Task-create error so the
-// operator knows manual cleanup may be required.
-func (r *TektonActionKubernetesResource) createResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+// Fix for issue #10 / Bug #1: if Task creation fails after StepAction creation
+// succeeded, the StepAction is rolled back via DeleteResource (idempotent on
+// NotFound per fix #11). If rollback itself fails, a warning is surfaced
+// alongside the original Task-create error so the operator knows manual
+// cleanup may be required.
+func (r *TektonActionAzureResource) createResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if err := operations.CreateResource(ctx, stepAction, "tekton.dev", "v1beta1", "stepactions"); err != nil {
 		diags.AddError(
@@ -403,8 +478,8 @@ func (r *TektonActionKubernetesResource) createResources(ctx context.Context, op
 	return diags
 }
 
-func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAzureResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var state TektonActionAzureResourceModel
 
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -431,48 +506,84 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 		return
 	}
 
+	// Reconcile the credentials Secret here as well as in Create/Update, because a
+	// rotated client secret changes only PROVIDER configuration -- no resource
+	// attribute moves, so Terraform reports "No changes" and never calls Update.
+	// Without this, rotating the password silently leaves the old value in the
+	// cluster and every action keeps authenticating with a credential the operator
+	// believes they have replaced.
+	//
+	// Read runs on every plan and refresh, so this is where convergence has to
+	// happen. Failures are warnings, not errors: Read must not break a plan, and
+	// Create/Update still surface a hard error on the paths that can.
+	if r.providerData != nil && !r.providerData.Azure.IsNull() {
+		azureConfig, cfgErr := azure.GetAzureConfig(ctx, &azure.ProviderModel{Azure: r.providerData.Azure})
+		if cfgErr == nil {
+			operations := tekton.NewResourceOperations(client)
+			if secErr := operations.ReconcileCredentialsSecret(
+				ctx, state.Namespace.ValueString(),
+				azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+				map[string]string{
+					"tenant-id":       azureConfig.TenantID,
+					"client-id":       azureConfig.ClientID,
+					"subscription-id": azureConfig.SubscriptionID,
+				},
+			); secErr != nil {
+				resp.Diagnostics.AddWarning(
+					"Could not reconcile the Azure credentials Secret",
+					fmt.Sprintf("The action will keep using whatever credential is already in the cluster: %s", secErr),
+				)
+			}
+		}
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// readResourceState performs the cluster-side existence check for the Tekton
-// Action resource. Returns whether Read should clear state from the response,
-// and any diagnostics to surface to the operator.
-//
-// Extracted from Read to enable unit testing against a fake dynamic.Interface
-// without constructing tfsdk.State / tfsdk.ReadRequest plumbing.
+// readResourceState performs the cluster-side existence check for the Azure
+// Tekton Action resource. Mirrors the K8s variant's helper.
 //
 // Fix for issue #9: classifies errors via apierrors.IsNotFound so that only
 // genuine NotFound responses trigger state removal. Transient errors (5xx,
 // RBAC, timeout, context cancellation) surface as diagnostics and retain
 // state. Both Task and StepAction are checked; asymmetric in-cluster drift
 // (one present, one missing) surfaces a warning and retains state.
-func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionKubernetesResourceModel) (removeFromState bool, diags diag.Diagnostics) {
+//
+// The namespace comes from STATE, not a constant: a StepAction is only resolvable
+// from a TaskRun in the same namespace, so reading the wrong one reports the
+// objects as deleted and produces a permanent drift warning.
+func (r *TektonActionAzureResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionAzureResourceModel) (removeFromState bool, diags diag.Diagnostics) {
 	taskGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
 	stepActionGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "stepactions"}
 
 	taskExists := true
-	_, err := client.Resource(taskGVR).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	ns := state.Namespace.ValueString()
+	if ns == "" {
+		ns = tektonPipelinesNamespace
+	}
+
+	_, err := client.Resource(taskGVR).Namespace(ns).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			taskExists = false
 		} else {
 			diags.AddError(
 				"Error reading Task",
-				fmt.Sprintf("Could not read Task %s/%s: %s", state.Namespace.ValueString(), state.TaskName.ValueString(), err.Error()),
+				fmt.Sprintf("Could not read Task %s/%s: %s", ns, state.TaskName.ValueString(), err.Error()),
 			)
 			return false, diags
 		}
 	}
 
 	stepActionExists := true
-	_, err = client.Resource(stepActionGVR).Namespace(state.Namespace.ValueString()).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
+	_, err = client.Resource(stepActionGVR).Namespace(ns).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			stepActionExists = false
 		} else {
 			diags.AddError(
 				"Error reading StepAction",
-				fmt.Sprintf("Could not read StepAction %s/%s: %s", state.Namespace.ValueString(), state.StepActionName.ValueString(), err.Error()),
+				fmt.Sprintf("Could not read StepAction %s/%s: %s", ns, state.StepActionName.ValueString(), err.Error()),
 			)
 			return false, diags
 		}
@@ -501,9 +612,9 @@ func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, 
 	}
 }
 
-func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan TektonActionKubernetesResourceModel
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan TektonActionAzureResourceModel
+	var state TektonActionAzureResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -521,9 +632,8 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		return
 	}
 
-	// Use state values for computed fields (StepActionName, TaskName, ID).
-	// Namespace has RequiresReplace(), so Update is never called with a
-	// changed namespace — no need to overwrite plan.Namespace.
+	// Use state values for computed fields (StepActionName, TaskName)
+	// These are computed and unknown in the plan
 	plan.StepActionName = state.StepActionName
 	plan.TaskName = state.TaskName
 	plan.ID = state.ID
@@ -542,7 +652,11 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		return
 	}
 
-	// Extract custom labels
+	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
+		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
+	}
+	ns := plan.Namespace.ValueString()
+
 	customLabels := make(map[string]string)
 	if !plan.Labels.IsNull() {
 		resp.Diagnostics.Append(plan.Labels.ElementsAs(ctx, &customLabels, false)...)
@@ -551,23 +665,73 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		}
 	}
 
-	// Create metadata
 	metadata := tekton.NewResourceMetadata(
 		plan.Name.ValueString(),
 		plan.FacetsResourceName.ValueString(),
 		facetsRes.Kind.ValueString(),
 		facetsEnv.UniqueName.ValueString(),
-		false, // cloud_action: false for Kubernetes actions
-		customLabels,
+		true,         // cloud_action: true for Azure actions
+		customLabels, // customLabels: not supported for Azure actions yet
 	)
 
-	// Build StepAction and Task
-	stepAction := tekton.BuildKubernetesStepAction(
+	// Validate provider data is available
+	if r.providerData == nil {
+		resp.Diagnostics.AddError(
+			"Provider Configuration Error",
+			"Provider data is not configured. Ensure the provider block is properly configured.",
+		)
+		return
+	}
+
+	// Get the Azure config from the provider block
+	azureProviderModel := &azure.ProviderModel{
+		Azure: r.providerData.Azure,
+	}
+	azureConfig, err := azure.GetAzureConfig(ctx, azureProviderModel)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Azure Configuration Error",
+			err.Error(),
+		)
+		return
+	}
+
+	// Update StepAction
+	// Reconcile on update too, so a rotated client secret propagates: the Secret is
+	// rewritten in place under the same derived name, and every action sharing that
+	// service principal picks up the new value on its next run.
+	// Unconditional: client-secret is the only auth mode, so there is nothing to
+	// branch on. A `Mode ==` guard here would read as a live check that can fail.
+	{
+		if err := operations.ReconcileCredentialsSecret(
+			ctx, plan.Namespace.ValueString(),
+			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
+			map[string]string{
+				"tenant-id":       azureConfig.TenantID,
+				"client-id":       azureConfig.ClientID,
+				"subscription-id": azureConfig.SubscriptionID,
+			},
+		); err != nil {
+			resp.Diagnostics.AddError("Could not provision the Azure credentials Secret", err.Error())
+			return
+		}
+	}
+
+	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
-		plan.Namespace.ValueString(),
+		ns,
 		metadata.LabelsAsInterface(),
+		azureConfig,
 	)
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error building StepAction",
+			fmt.Sprintf("Could not build StepAction: %s", err.Error()),
+		)
+		return
+	}
+	// Build Task
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -577,9 +741,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-// updateResources updates the Task and StepAction in cluster. Returns
-// diagnostics. Extracted from Update so unit tests can exercise the
-// ordering invariant with a fake dynamic client.
+// updateResources updates the Task and StepAction in cluster. Mirrors the K8s variant.
 //
 // Task-first ordering rationale: updating Task before StepAction ensures that
 // if Task update fails (validation, RBAC, webhook), the StepAction is never
@@ -588,7 +750,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 // functional because the Task references the StepAction by immutable ref.name;
 // the old StepAction spec still resolves. The operator re-runs to retry the
 // StepAction update only.
-func (r *TektonActionKubernetesResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
+func (r *TektonActionAzureResource) updateResources(ctx context.Context, operations *tekton.ResourceOperations, stepAction, task *unstructured.Unstructured) diag.Diagnostics {
 	var diags diag.Diagnostics
 	// Update Task FIRST. If it fails (validation, RBAC, webhook), the StepAction
 	// is never touched and the cluster remains in a coherent pre-Update state.
@@ -614,8 +776,8 @@ func (r *TektonActionKubernetesResource) updateResources(ctx context.Context, op
 	return diags
 }
 
-func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
-	var state TektonActionKubernetesResourceModel
+func (r *TektonActionAzureResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var state TektonActionAzureResourceModel
 
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -632,7 +794,11 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 		return
 	}
 
-	resp.Diagnostics.Append(r.deleteResources(ctx, operations, state.Namespace.ValueString(), state.TaskName.ValueString(), state.StepActionName.ValueString())...)
+	delNS := state.Namespace.ValueString()
+	if delNS == "" {
+		delNS = tektonPipelinesNamespace
+	}
+	resp.Diagnostics.Append(r.deleteResources(ctx, operations, delNS, state.TaskName.ValueString(), state.StepActionName.ValueString())...)
 }
 
 // deleteResources attempts to delete both the Task and the StepAction, using
@@ -640,7 +806,10 @@ func (r *TektonActionKubernetesResource) Delete(ctx context.Context, req resourc
 // errors are aggregated into the returned diagnostics. Combined with the
 // idempotent DeleteResource (which treats NotFound as success), this means
 // destroy retries are safe.
-func (r *TektonActionKubernetesResource) deleteResources(ctx context.Context, operations *tekton.ResourceOperations, namespace, taskName, stepActionName string) diag.Diagnostics {
+//
+// Note: the AWS variant has no namespace attribute, so it pins the constant
+// instead of resolving one.
+func (r *TektonActionAzureResource) deleteResources(ctx context.Context, operations *tekton.ResourceOperations, namespace, taskName, stepActionName string) diag.Diagnostics {
 	var diags diag.Diagnostics
 	taskErr := operations.DeleteResource(ctx, namespace, taskName, "tekton.dev", "v1beta1", "tasks")
 	stepActionErr := operations.DeleteResource(ctx, namespace, stepActionName, "tekton.dev", "v1beta1", "stepactions")
@@ -659,21 +828,39 @@ func (r *TektonActionKubernetesResource) deleteResources(ctx context.Context, op
 	return diags
 }
 
-func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import format: namespace/taskName
-	// Example: tekton-pipelines/59f6f855860ddc99a32e2944c96db5fa
-
-	idParts := regexp.MustCompile(`^([^/]+)/([^/]+)$`).FindStringSubmatch(req.ID)
-	if len(idParts) != 3 {
-		resp.Diagnostics.AddError(
-			"Invalid Import ID",
-			fmt.Sprintf("Expected import ID in format: namespace/taskName, got: %s", req.ID),
-		)
-		return
+// schemaAttrElemType returns the element type the SCHEMA declares for a list
+// attribute. Derived rather than hand-written so it cannot drift from the schema
+// as steps/params gain fields.
+func schemaAttrElemType(r *TektonActionAzureResource, name string) attr.Type {
+	var resp resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &resp)
+	if a, ok := resp.Schema.Attributes[name]; ok {
+		if lt, ok := a.GetType().(types.ListType); ok {
+			return lt.ElementType()
+		}
 	}
+	// Unreachable for the current schema; a bare object keeps the null typed
+	// rather than panicking if the attribute is ever restructured.
+	return types.ObjectType{}
+}
 
-	namespace := idParts[1]
-	taskName := idParts[2]
+func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Import format: taskName or namespace/taskName.
+	// Example: 59f6f855860ddc99a32e2944c96db5fa
+	// Example: my-namespace/59f6f855860ddc99a32e2944c96db5fa
+	//
+	// The namespace is HONOURED when supplied. It used to be parsed and discarded,
+	// which meant an action living outside tekton-pipelines could not be imported at
+	// all -- the lookup went to the wrong namespace and reported the Task missing.
+	taskName := req.ID
+	importNS := tektonPipelinesNamespace
+	if strings.Contains(req.ID, "/") {
+		parts := strings.SplitN(req.ID, "/", 2)
+		if parts[0] != "" {
+			importNS = parts[0]
+		}
+		taskName = parts[1]
+	}
 
 	// Create fresh client for this operation
 	client, _, err := r.getClient()
@@ -692,11 +879,11 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 		Resource: "tasks",
 	}
 
-	task, err := client.Resource(gvr).Namespace(namespace).Get(ctx, taskName, metav1.GetOptions{})
+	task, err := client.Resource(gvr).Namespace(importNS).Get(ctx, taskName, metav1.GetOptions{})
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error importing resource",
-			fmt.Sprintf("Could not find Task %s/%s: %s", namespace, taskName, err.Error()),
+			fmt.Sprintf("Could not find Task %s/%s: %s", importNS, taskName, err.Error()),
 		)
 		return
 	}
@@ -711,9 +898,10 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 		return
 	}
 
-	// Prefer the annotation: the display_name label is sanitized and therefore
-	// lossy, so reconstructing `name` from it produces a spurious first-plan diff.
-	// Fall back to the label for Tasks created before the annotation existed.
+	// Prefer the annotation: the label is sanitized and therefore lossy, so
+	// reconstructing `name` from it produced a spurious diff on the first plan
+	// ("Stop-Database" -> "Stop Database"). Fall back to the label for Tasks created
+	// before the annotation existed.
 	annotations := task.GetAnnotations()
 	displayName, hasDisplayName := annotations[tekton.DisplayNameAnnotation]
 	if !hasDisplayName || displayName == "" {
@@ -735,13 +923,35 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	stepActionName := fmt.Sprintf("setup-credentials-%s", taskName)
 
 	// Set state with imported values
-	state := TektonActionKubernetesResourceModel{
-		ID:                 types.StringValue(fmt.Sprintf("%s/%s", namespace, taskName)),
+	state := TektonActionAzureResourceModel{
+		ID:                 types.StringValue(fmt.Sprintf("%s/%s", importNS, taskName)),
 		Name:               types.StringValue(displayName),
 		FacetsResourceName: types.StringValue(resourceName),
-		Namespace:          types.StringValue(namespace),
 		TaskName:           types.StringValue(taskName),
 		StepActionName:     types.StringValue(stepActionName),
+		// Record the namespace the objects were actually found in. Leaving this
+		// unset makes it unknown in state, and because it carries RequiresReplace
+		// the next plan would want to destroy and recreate the imported action.
+		Namespace: types.StringValue(importNS),
+
+		// The object- and list-typed attributes MUST carry their element types even
+		// when null. A zero-value types.Object has no attribute types, which the
+		// framework rejects: "Value Conversion Error ... Received framework type
+		// types.ObjectType[]". That made `terraform import` fail outright for this
+		// resource type -- a pre-existing bug, surfaced once the namespace fix let
+		// import get far enough to reach the type check.
+		//
+		// These cannot be reconstructed from the Task, so they are TYPED nulls; the
+		// operator supplies them in configuration and the next plan reconciles.
+		FacetsEnvironment: types.ObjectNull(map[string]attr.Type{
+			"unique_name": types.StringType,
+		}),
+		FacetsResource: types.ObjectNull(map[string]attr.Type{
+			"kind": types.StringType,
+		}),
+		Labels: types.MapNull(types.StringType),
+		Steps:  types.ListNull(schemaAttrElemType(r, "steps")),
+		Params: types.ListNull(schemaAttrElemType(r, "params")),
 	}
 
 	// Note: We cannot fully reconstruct facets_environment, facets_resource, steps, params from the Task
@@ -754,46 +964,33 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// buildTask creates the Tekton Task for Kubernetes workflows
-func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan TektonActionKubernetesResourceModel, labels, annotations map[string]interface{}) *unstructured.Unstructured {
+// buildAzureTask creates the Tekton Task for Azure workflows
+func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels, annotations map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
 
+	// First step: setup-credentials (references StepAction, no params needed)
 	tektonSteps := []interface{}{
 		map[string]interface{}{
 			"name": "setup-credentials",
 			"ref": map[string]interface{}{
 				"name": plan.StepActionName.ValueString(),
 			},
-			"params": []interface{}{
-				map[string]interface{}{
-					"name":  "FACETS_USER_KUBECONFIG",
-					"value": "$(params.FACETS_USER_KUBECONFIG)",
-				},
-			},
 		},
 	}
 
+	// Add user-defined steps with AZURE_CONFIG_DIR pointing at the shared profile
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
-		tekton.AddEnvVar(tektonStep, "KUBECONFIG", "/workspace/.kube/config")
+		// Point the Azure CLI at the profile written by the setup-credentials step
+		tekton.AddEnvVar(tektonStep, "AZURE_CONFIG_DIR", tekton.AzureConfigDir)
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
-	// Build params
-	taskParams := []interface{}{
-		map[string]interface{}{
-			"name": "FACETS_USER_EMAIL",
-			"type": "string",
-		},
-		map[string]interface{}{
-			"name": "FACETS_USER_KUBECONFIG",
-			"type": "string",
-		},
-	}
-
-	// Add user-defined params
+	// Build params: user-defined only. Credentials are injected by the
+	// setup-credentials step, so no credential params are needed.
+	taskParams := []interface{}{}
 	if !plan.Params.IsNull() {
 		var params []tekton.ParamModel
 		plan.Params.ElementsAs(ctx, &params, false)
@@ -805,10 +1002,15 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		}
 	}
 
+	description := plan.TaskName.ValueString()
+	if !plan.Description.IsNull() && plan.Description.ValueString() != "" {
+		description = plan.Description.ValueString()
+	}
+
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
 		Namespace:   plan.Namespace.ValueString(),
-		Description: plan.Description.ValueString(),
+		Description: description,
 		Labels:      labels,
 		Annotations: annotations,
 	}, tektonSteps, taskParams)

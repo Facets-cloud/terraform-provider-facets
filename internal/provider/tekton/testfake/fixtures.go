@@ -45,3 +45,25 @@ func buildTektonObject(kind, namespace, name string, labels map[string]string) *
 
 	return obj
 }
+
+// Secret returns a core/v1 Secret fixture. `data` values are given in PLAIN
+// text and stored under stringData, matching how the provider writes them --
+// the fake client does no base64 encoding, so tests compare plain values.
+func Secret(namespace, name string, data map[string]string) *unstructured.Unstructured {
+	sd := make(map[string]any, len(data))
+	for k, v := range data {
+		sd[k] = v
+	}
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"namespace": namespace,
+				"name":      name,
+			},
+			"type":       "Opaque",
+			"stringData": sd,
+		},
+	}
+}
