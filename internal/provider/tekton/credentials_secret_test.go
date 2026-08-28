@@ -6,6 +6,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/facets-cloud/terraform-provider-facets/internal/provider/tekton/testfake"
 )
 
@@ -188,4 +191,95 @@ func unstructuredString(obj map[string]interface{}, fields ...string) (string, b
 		}
 	}
 	return "", false, nil
+}
+
+// Adoption must not destroy keys it does not own. The desired object sends only
+// stringData, and a full Update with no `data` replaces the stored map -- on a real
+// apiserver conversion.go merges StringData into a data map that starts nil, so
+// every other key in the Secret is dropped.
+func TestReconcileCredentialsSecret_PreservesOtherKeys(t *testing.T) {
+	existing := testfake.Secret(secretNS, secretName, map[string]string{
+		"client_secret":  "old",
+		"unrelated_key":  "must-survive",
+		"another_tenant": "also-must-survive",
+	})
+	c := testfake.NewClient(existing)
+	ops := NewResourceOperations(c)
+
+	if err := ops.ReconcileCredentialsSecret(
+		context.Background(), secretNS, secretName, secretKey, "new", identity(),
+	); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got, err := c.Resource(testfake.SecretGVR).Namespace(secretNS).
+		Get(context.Background(), secretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"unrelated_key", "another_tenant"} {
+		if !secretHasKey(got.Object, k) {
+			t.Errorf("adoption destroyed key %q", k)
+		}
+	}
+}
+
+// A Secret's `type` is immutable (ValidateSecretUpdate). Hardcoding Opaque on the
+// desired object makes adopting a non-Opaque Secret fail, so the type must be
+// carried over from whatever is already stored.
+func TestReconcileCredentialsSecret_PreservesSecretType(t *testing.T) {
+	existing := testfake.Secret(secretNS, secretName, map[string]string{secretKey: "old"})
+	existing.Object["type"] = "kubernetes.io/dockerconfigjson"
+	c := testfake.NewClient(existing)
+	ops := NewResourceOperations(c)
+
+	if err := ops.ReconcileCredentialsSecret(
+		context.Background(), secretNS, secretName, secretKey, "new", identity(),
+	); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, _ := c.Resource(testfake.SecretGVR).Namespace(secretNS).
+		Get(context.Background(), secretName, metav1.GetOptions{})
+	if got.Object["type"] != "kubernetes.io/dockerconfigjson" {
+		t.Errorf("type must be preserved, got %v", got.Object["type"])
+	}
+}
+
+// Swallowing Forbidden or Conflict on update reports a green apply while the OLD
+// password stays live -- exactly the silent-stale-credential failure the Read
+// reconcile exists to prevent.
+func TestReconcileCredentialsSecret_UpdateFailuresAreReported(t *testing.T) {
+	for name, injected := range map[string]error{
+		"forbidden": testfake.ErrForbidden(testfake.SecretGVR, secretName),
+		"conflict":  errConflict(secretName),
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := testfake.NewClient(testfake.Secret(secretNS, secretName,
+				map[string]string{secretKey: "old-password"}))
+			testfake.WithError(c, "update", testfake.SecretGVR, injected)
+			ops := NewResourceOperations(c)
+
+			err := ops.ReconcileCredentialsSecret(
+				context.Background(), secretNS, secretName, secretKey, "rotated", identity())
+			if err == nil {
+				t.Error("a failed update must surface: the stored credential is stale")
+			}
+		})
+	}
+}
+
+func secretHasKey(obj map[string]interface{}, key string) bool {
+	for _, field := range []string{"data", "stringData"} {
+		if m, ok := obj[field].(map[string]interface{}); ok {
+			if _, found := m[key]; found {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func errConflict(name string) error {
+	return k8serrors.NewConflict(
+		k8sschema.GroupResource{Resource: "secrets"}, name, nil)
 }

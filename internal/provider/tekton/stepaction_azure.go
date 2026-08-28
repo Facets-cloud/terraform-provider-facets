@@ -92,6 +92,22 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 // service-account token for an Azure token, so no secret exists anywhere. This is
 // the Azure analogue of the AWS IRSA flow and works cross-cloud, which matters
 // when the Tekton pod runs in EKS while the target resources live in Azure.
+// shellQuote renders v as a single-quoted POSIX shell word, safe to interpolate
+// into a generated script.
+//
+// Go's %q is GO quoting, not SHELL quoting: it emits double quotes, inside which
+// bash still expands $(...), backticks and $VAR. These values arrive from a
+// cloud_account spec, so %q allowed a malicious or careless client_id to execute
+// arbitrary shell in the action pod.
+//
+// Single quotes suppress every form of expansion in POSIX shells. The only
+// character that cannot appear inside them is the single quote itself, which is
+// escaped by closing the string, emitting an escaped quote, and reopening:
+// don't -> 'don'\”t'.
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
 func GenerateAzureLoginScript(config *azure.AzureAuthConfig) string {
 	var b strings.Builder
 
@@ -111,29 +127,30 @@ fi
 	// working step produced a COMPLETELY EMPTY log -- indistinguishable from a step
 	// that never ran. Whoever clicks the action has no other signal, so say what is
 	// happening and confirm the identity afterwards.
-	b.WriteString(fmt.Sprintf(`echo "Authenticating to Azure as service principal %s"
-echo "  tenant:       %s"
-echo "  subscription: %s"
+	b.WriteString(fmt.Sprintf(`echo Authenticating to Azure as service principal %s
+echo "  tenant:      " %s
+echo "  subscription:" %s
 
 az login --service-principal \
-  --username %q \
+  --username %s \
   --password "$FACETS_AZURE_CLIENT_SECRET" \
-  --tenant %q \
+  --tenant %s \
   --output none
 
 echo "Login succeeded."
-`, config.ClientID, config.TenantID, config.SubscriptionID, config.ClientID, config.TenantID))
+`, shellQuote(config.ClientID), shellQuote(config.TenantID), shellQuote(config.SubscriptionID),
+		shellQuote(config.ClientID), shellQuote(config.TenantID)))
 
 	b.WriteString(fmt.Sprintf(`
-az account set --subscription %q
-echo "Active subscription set to %s"
+az account set --subscription %s
+echo Active subscription set to %s
 
 # Echo back what Azure thinks we are, so an authorization failure in a LATER step
 # can be told apart from a wrong-identity problem here.
 az account show --query "{subscriptionId:id, tenantId:tenantId, identity:user.name, type:user.type}" -o json
 
 echo "Azure CLI profile written to $AZURE_CONFIG_DIR -- later steps inherit it."
-`, config.SubscriptionID, config.SubscriptionID))
+`, shellQuote(config.SubscriptionID), shellQuote(config.SubscriptionID)))
 
 	return b.String()
 }

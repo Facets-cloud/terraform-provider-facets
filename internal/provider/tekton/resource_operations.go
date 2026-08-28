@@ -180,21 +180,61 @@ func (r *ResourceOperations) ReconcileCredentialsSecret(ctx context.Context, nam
 		return fmt.Errorf("could not read Secret %q in namespace %q: %w", name, namespace, err)
 	}
 
-	// Adopt whatever is there. A pre-existing hand-created Secret is updated in
-	// place rather than rejected, so switching to provider-managed credentials
-	// needs no manual cleanup.
-	desired.SetResourceVersion(existing.GetResourceVersion())
-	if _, uerr := r.client.Resource(gvr).Namespace(namespace).Update(ctx, desired, metav1.UpdateOptions{}); uerr != nil {
+	// Adopt whatever is there, but MUTATE THE EXISTING OBJECT rather than replacing
+	// it with `desired`. A full Update carrying only stringData drops every other
+	// key: the apiserver merges StringData into a data map that, for a
+	// stringData-only object, starts empty. A Secret shared with other tooling would
+	// silently lose its other entries.
+	//
+	// `type` is immutable (ValidateSecretUpdate), so it must be left exactly as
+	// stored -- hardcoding Opaque made adopting a non-Opaque Secret fail outright.
+	existing.SetLabels(mergeStringMap(existing.GetLabels(), labels))
+	existing.SetAnnotations(mergeStringMap(existing.GetAnnotations(), annotations))
+
+	// stringData is write-only sugar the apiserver folds into data and clears, but
+	// do not assume it is empty: MERGE our key in rather than replacing the map, so
+	// a caller (or a fake apiserver) that leaves values there keeps them.
+	sd, _ := existing.Object["stringData"].(map[string]interface{})
+	if sd == nil {
+		sd = map[string]interface{}{}
+	}
+	sd[key] = clientSecret
+	existing.Object["stringData"] = sd
+
+	if _, uerr := r.client.Resource(gvr).Namespace(namespace).Update(ctx, existing, metav1.UpdateOptions{}); uerr != nil {
+		// Do NOT swallow these. A failed update means the OLD credential is still
+		// live while the apply reports success -- the silent-stale-credential
+		// failure this reconcile exists to prevent. Surface it and let the operator
+		// decide.
 		if k8serrors.IsForbidden(uerr) {
-			return nil
+			return fmt.Errorf("not permitted to update Secret %q in namespace %q: %w\n"+
+				"The stored credential is unchanged, so actions will keep using the "+
+				"previous password. Grant update on secrets in that namespace, or "+
+				"update the Secret out of band", name, namespace, uerr)
 		}
 		if k8serrors.IsConflict(uerr) {
-			// Concurrent write of the same identity's credential; converges.
-			return nil
+			return fmt.Errorf("conflict updating Secret %q in namespace %q: %w\n"+
+				"Another writer changed it concurrently. Re-run to retry; the stored "+
+				"credential may still be the previous password", name, namespace, uerr)
 		}
 		return fmt.Errorf("could not update Secret %q in namespace %q: %w", name, namespace, uerr)
 	}
 	return nil
+}
+
+// mergeStringMap overlays src onto dst without discarding keys dst already has.
+// src is map[string]interface{} because it comes from an unstructured object body.
+func mergeStringMap(dst map[string]string, src map[string]interface{}) map[string]string {
+	out := map[string]string{}
+	for k, v := range dst {
+		out[k] = v
+	}
+	for k, v := range src {
+		if sv, ok := v.(string); ok {
+			out[k] = sv
+		}
+	}
+	return out
 }
 
 // GetResource retrieves a Kubernetes resource

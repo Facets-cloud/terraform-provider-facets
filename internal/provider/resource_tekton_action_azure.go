@@ -336,11 +336,15 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 	)
 	plan.TaskName = types.StringValue(names.TaskName)
 	plan.StepActionName = types.StringValue(names.StepActionName)
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", tektonPipelinesNamespace, names.TaskName))
-
+	// Resolve the namespace BEFORE anything derives from it. A StepAction is only
+	// resolvable from a TaskRun in the same namespace, so the Task, StepAction,
+	// Secret, the ID and every later Read/Delete must all agree on this one value.
 	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
 		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
 	}
+	ns := plan.Namespace.ValueString()
+
+	plan.ID = types.StringValue(fmt.Sprintf("%s/%s", ns, names.TaskName))
 
 	customLabels := make(map[string]string)
 	if !plan.Labels.IsNull() {
@@ -404,7 +408,7 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 	// Create StepAction
 	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
-		tektonPipelinesNamespace,
+		ns,
 		metadata.LabelsAsInterface(),
 		azureConfig,
 	)
@@ -541,35 +545,41 @@ func (r *TektonActionAzureResource) Read(ctx context.Context, req resource.ReadR
 // state. Both Task and StepAction are checked; asymmetric in-cluster drift
 // (one present, one missing) surfaces a warning and retains state.
 //
-// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
-// (the AWS model has no Namespace field).
+// The namespace comes from STATE, not a constant: a StepAction is only resolvable
+// from a TaskRun in the same namespace, so reading the wrong one reports the
+// objects as deleted and produces a permanent drift warning.
 func (r *TektonActionAzureResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionAzureResourceModel) (removeFromState bool, diags diag.Diagnostics) {
 	taskGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
 	stepActionGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "stepactions"}
 
 	taskExists := true
-	_, err := client.Resource(taskGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	ns := state.Namespace.ValueString()
+	if ns == "" {
+		ns = tektonPipelinesNamespace
+	}
+
+	_, err := client.Resource(taskGVR).Namespace(ns).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			taskExists = false
 		} else {
 			diags.AddError(
 				"Error reading Task",
-				fmt.Sprintf("Could not read Task %s/%s: %s", tektonPipelinesNamespace, state.TaskName.ValueString(), err.Error()),
+				fmt.Sprintf("Could not read Task %s/%s: %s", ns, state.TaskName.ValueString(), err.Error()),
 			)
 			return false, diags
 		}
 	}
 
 	stepActionExists := true
-	_, err = client.Resource(stepActionGVR).Namespace(tektonPipelinesNamespace).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
+	_, err = client.Resource(stepActionGVR).Namespace(ns).Get(ctx, state.StepActionName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			stepActionExists = false
 		} else {
 			diags.AddError(
 				"Error reading StepAction",
-				fmt.Sprintf("Could not read StepAction %s/%s: %s", tektonPipelinesNamespace, state.StepActionName.ValueString(), err.Error()),
+				fmt.Sprintf("Could not read StepAction %s/%s: %s", ns, state.StepActionName.ValueString(), err.Error()),
 			)
 			return false, diags
 		}
@@ -641,6 +651,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 	if plan.Namespace.IsNull() || plan.Namespace.ValueString() == "" {
 		plan.Namespace = types.StringValue(tektonPipelinesNamespace)
 	}
+	ns := plan.Namespace.ValueString()
 
 	customLabels := make(map[string]string)
 	if !plan.Labels.IsNull() {
@@ -702,7 +713,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 
 	stepAction, err := tekton.BuildAzureStepAction(
 		plan.StepActionName.ValueString(),
-		tektonPipelinesNamespace,
+		ns,
 		metadata.LabelsAsInterface(),
 		azureConfig,
 	)
@@ -777,7 +788,11 @@ func (r *TektonActionAzureResource) Delete(ctx context.Context, req resource.Del
 		return
 	}
 
-	resp.Diagnostics.Append(r.deleteResources(ctx, operations, tektonPipelinesNamespace, state.TaskName.ValueString(), state.StepActionName.ValueString())...)
+	delNS := state.Namespace.ValueString()
+	if delNS == "" {
+		delNS = tektonPipelinesNamespace
+	}
+	resp.Diagnostics.Append(r.deleteResources(ctx, operations, delNS, state.TaskName.ValueString(), state.StepActionName.ValueString())...)
 }
 
 // deleteResources attempts to delete both the Task and the StepAction, using
@@ -808,14 +823,20 @@ func (r *TektonActionAzureResource) deleteResources(ctx context.Context, operati
 }
 
 func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import format: taskName or namespace/taskName (namespace is ignored, always uses tekton-pipelines)
+	// Import format: taskName or namespace/taskName.
 	// Example: 59f6f855860ddc99a32e2944c96db5fa
-	// Example: tekton-pipelines/59f6f855860ddc99a32e2944c96db5fa
-
+	// Example: my-namespace/59f6f855860ddc99a32e2944c96db5fa
+	//
+	// The namespace is HONOURED when supplied. It used to be parsed and discarded,
+	// which meant an action living outside tekton-pipelines could not be imported at
+	// all -- the lookup went to the wrong namespace and reported the Task missing.
 	taskName := req.ID
-	// Support legacy format namespace/taskName - extract just the task name
+	importNS := tektonPipelinesNamespace
 	if strings.Contains(req.ID, "/") {
 		parts := strings.SplitN(req.ID, "/", 2)
+		if parts[0] != "" {
+			importNS = parts[0]
+		}
 		taskName = parts[1]
 	}
 
@@ -836,11 +857,11 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 		Resource: "tasks",
 	}
 
-	task, err := client.Resource(gvr).Namespace(tektonPipelinesNamespace).Get(ctx, taskName, metav1.GetOptions{})
+	task, err := client.Resource(gvr).Namespace(importNS).Get(ctx, taskName, metav1.GetOptions{})
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error importing resource",
-			fmt.Sprintf("Could not find Task %s/%s: %s", tektonPipelinesNamespace, taskName, err.Error()),
+			fmt.Sprintf("Could not find Task %s/%s: %s", importNS, taskName, err.Error()),
 		)
 		return
 	}
@@ -873,11 +894,15 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 
 	// Set state with imported values
 	state := TektonActionAzureResourceModel{
-		ID:                 types.StringValue(fmt.Sprintf("%s/%s", tektonPipelinesNamespace, taskName)),
+		ID:                 types.StringValue(fmt.Sprintf("%s/%s", importNS, taskName)),
 		Name:               types.StringValue(displayName),
 		FacetsResourceName: types.StringValue(resourceName),
 		TaskName:           types.StringValue(taskName),
 		StepActionName:     types.StringValue(stepActionName),
+		// Record the namespace the objects were actually found in. Leaving this
+		// unset makes it unknown in state, and because it carries RequiresReplace
+		// the next plan would want to destroy and recreate the imported action.
+		Namespace: types.StringValue(importNS),
 	}
 
 	// Note: We cannot fully reconstruct facets_environment, facets_resource, steps, params from the Task
