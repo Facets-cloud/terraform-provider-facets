@@ -246,8 +246,9 @@ func (r *TektonActionAzureResource) Schema(ctx context.Context, req resource.Sch
 				Computed: true,
 			},
 			"step_action_name": schema.StringAttribute{
-				Description: "Generated StepAction name for AWS credential setup (computed from hash). " +
-					"This StepAction automatically configures AWS access for the workflow steps.",
+				Description: "Generated StepAction name for Azure credential setup (computed from hash). " +
+					"This StepAction runs 'az login' as the configured service principal and writes " +
+					"an Azure CLI profile that the workflow steps inherit.",
 				Computed: true,
 			},
 		},
@@ -258,9 +259,9 @@ func (r *TektonActionAzureResource) Configure(ctx context.Context, req resource.
 	// Client will be created lazily when needed during CRUD operations.
 	// This allows terraform validate to pass without requiring a kubeconfig.
 
-	// Store provider data for accessing AWS config during Create/Update
-	// Note: We validate AWS config lazily during CRUD operations, not here,
-	// to allow terraform validate to succeed without AWS credentials.
+	// Store provider data for accessing the Azure config during Create/Update.
+	// Validation is lazy -- done during CRUD, not here -- so `terraform validate`
+	// succeeds without Azure credentials present.
 	if req.ProviderData != nil {
 		// Type assert to get provider model
 		providerModel, ok := req.ProviderData.(*FacetsProviderModel)
@@ -373,7 +374,7 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 
-	// Get AWS config
+	// Get the Azure config from the provider block
 	azureProviderModel := &azure.ProviderModel{
 		Azure: r.providerData.Azure,
 	}
@@ -539,7 +540,7 @@ func (r *TektonActionAzureResource) Read(ctx context.Context, req resource.ReadR
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// readResourceState performs the cluster-side existence check for the AWS
+// readResourceState performs the cluster-side existence check for the Azure
 // Tekton Action resource. Mirrors the K8s variant's helper.
 //
 // Fix for issue #9: classifies errors via apierrors.IsNotFound so that only
@@ -682,7 +683,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 
-	// Get AWS config
+	// Get the Azure config from the provider block
 	azureProviderModel := &azure.ProviderModel{
 		Azure: r.providerData.Azure,
 	}
@@ -806,8 +807,8 @@ func (r *TektonActionAzureResource) Delete(ctx context.Context, req resource.Del
 // idempotent DeleteResource (which treats NotFound as success), this means
 // destroy retries are safe.
 //
-// Note: the AWS variant pins the namespace to tektonPipelinesNamespace
-// (the AWS model has no Namespace field).
+// Note: the AWS variant has no namespace attribute, so it pins the constant
+// instead of resolving one.
 func (r *TektonActionAzureResource) deleteResources(ctx context.Context, operations *tekton.ResourceOperations, namespace, taskName, stepActionName string) diag.Diagnostics {
 	var diags diag.Diagnostics
 	taskErr := operations.DeleteResource(ctx, namespace, taskName, "tekton.dev", "v1beta1", "tasks")
@@ -987,7 +988,8 @@ func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan Tek
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
-	// Build params (only user-defined params, no AWS params needed)
+	// Build params: user-defined only. Credentials are injected by the
+	// setup-credentials step, so no credential params are needed.
 	taskParams := []interface{}{}
 	if !plan.Params.IsNull() {
 		var params []tekton.ParamModel
