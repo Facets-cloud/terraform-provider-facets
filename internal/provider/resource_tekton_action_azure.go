@@ -421,7 +421,7 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), azureConfig.Mode)
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface(), azureConfig.Mode)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -726,7 +726,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), azureConfig.Mode)
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface(), azureConfig.Mode)
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -893,7 +893,15 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 		return
 	}
 
-	displayName, hasDisplayName := labels["display_name"]
+	// Prefer the annotation: the label is sanitized and therefore lossy, so
+	// reconstructing `name` from it produced a spurious diff on the first plan
+	// ("Stop-Database" -> "Stop Database"). Fall back to the label for Tasks created
+	// before the annotation existed.
+	annotations := task.GetAnnotations()
+	displayName, hasDisplayName := annotations[tekton.DisplayNameAnnotation]
+	if !hasDisplayName || displayName == "" {
+		displayName, hasDisplayName = labels["display_name"]
+	}
 	resourceName, hasResourceName := labels["resource_name"]
 	_, hasResourceKind := labels["resource_kind"]
 	_, hasEnvUniqueName := labels["environment_unique_name"]
@@ -952,7 +960,7 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 }
 
 // buildAzureTask creates the Tekton Task for Azure workflows
-func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels map[string]interface{}, azureMode azure.AuthMode) *unstructured.Unstructured {
+func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels, annotations map[string]interface{}, azureMode azure.AuthMode) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
@@ -998,5 +1006,6 @@ func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan Tek
 		Namespace:   plan.Namespace.ValueString(),
 		Description: description,
 		Labels:      labels,
+		Annotations: annotations,
 	}, tektonSteps, taskParams)
 }

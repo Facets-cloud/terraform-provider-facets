@@ -347,7 +347,7 @@ func (r *TektonActionKubernetesResource) Create(ctx context.Context, req resourc
 	)
 
 	// Build Task
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -567,7 +567,7 @@ func (r *TektonActionKubernetesResource) Update(ctx context.Context, req resourc
 		plan.Namespace.ValueString(),
 		metadata.LabelsAsInterface(),
 	)
-	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -711,7 +711,14 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 		return
 	}
 
-	displayName, hasDisplayName := labels["display_name"]
+	// Prefer the annotation: the display_name label is sanitized and therefore
+	// lossy, so reconstructing `name` from it produces a spurious first-plan diff.
+	// Fall back to the label for Tasks created before the annotation existed.
+	annotations := task.GetAnnotations()
+	displayName, hasDisplayName := annotations[tekton.DisplayNameAnnotation]
+	if !hasDisplayName || displayName == "" {
+		displayName, hasDisplayName = labels["display_name"]
+	}
 	resourceName, hasResourceName := labels["resource_name"]
 	_, hasResourceKind := labels["resource_kind"]
 	_, hasEnvUniqueName := labels["environment_unique_name"]
@@ -748,7 +755,7 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 }
 
 // buildTask creates the Tekton Task for Kubernetes workflows
-func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan TektonActionKubernetesResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
+func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan TektonActionKubernetesResourceModel, labels, annotations map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
@@ -803,5 +810,6 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		Namespace:   plan.Namespace.ValueString(),
 		Description: plan.Description.ValueString(),
 		Labels:      labels,
+		Annotations: annotations,
 	}, tektonSteps, taskParams)
 }

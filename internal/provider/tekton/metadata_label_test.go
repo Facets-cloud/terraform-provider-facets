@@ -67,3 +67,43 @@ func TestLabels_DisplayNameRemainsMeaningful(t *testing.T) {
 		t.Errorf("sanitized label %q lost the original wording", stop)
 	}
 }
+
+// Sanitizing display_name made the LABEL lossy, and ImportState reconstructs
+// `name` from it -- so import produced a spurious "Stop-Database" -> "Stop
+// Database" diff on the first plan, in all three action types. The raw name now
+// travels in an annotation, which has no charset restriction.
+func TestAnnotations_CarryRawDisplayNameForImport(t *testing.T) {
+	for _, name := range []string{
+		"Stop Database",
+		"Restart & Verify",
+		"Scale Up/Down",
+		"Ünïcödé Ãction",
+		"100% CPU check",
+	} {
+		m := NewResourceMetadata(name, "db-1", "postgres", "env-1", true, nil)
+
+		if got := m.Annotations()[DisplayNameAnnotation]; got != name {
+			t.Errorf("annotation must round-trip exactly: got %q, want %q", got, name)
+		}
+		// and the label is still valid, i.e. we did not simply stop sanitizing
+		if errs := validation.IsValidLabelValue(m.Labels()["display_name"]); len(errs) > 0 {
+			t.Errorf("label for %q is invalid: %v", name, errs)
+		}
+	}
+}
+
+// Only display_name was sanitized; resource_name, resource_kind,
+// environment_unique_name and custom labels went through raw. Each of those comes
+// from blueprint data and is only conventionally label-safe -- one bad character in
+// any of them fails the whole apply.
+func TestLabels_EveryValueIsSanitized(t *testing.T) {
+	nasty := "has space/and&symbols"
+	m := NewResourceMetadata(nasty, nasty, nasty, nasty, true,
+		map[string]string{"custom": nasty})
+
+	for k, v := range m.Labels() {
+		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+			t.Errorf("label %s=%q not sanitized: %v", k, v, errs)
+		}
+	}
+}

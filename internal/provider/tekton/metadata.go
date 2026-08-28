@@ -44,20 +44,49 @@ func NewResourceMetadata(displayName, resourceName, resourceKind, envUniqueName 
 func (m *ResourceMetadata) Labels() map[string]string {
 	labels := make(map[string]string)
 
-	// First, add custom labels (if any)
+	// Custom labels are sanitized too: they are user-supplied, and one invalid
+	// value rejects the whole object.
 	for k, v := range m.CustomLabels {
-		labels[k] = v
+		labels[k] = sanitizeLabelValue(v)
 	}
 
-	// Then, add auto-generated labels (these take precedence)
+	// EVERY generated value is sanitized, not just display_name. resource_name,
+	// resource_kind and environment_unique_name all originate from blueprint data
+	// and are only conventionally label-safe -- a single invalid character in any
+	// one of them fails the entire apply, exactly as display_name did.
 	labels["display_name"] = sanitizeLabelValue(m.DisplayName)
-	labels["resource_name"] = m.ResourceName
-	labels["resource_kind"] = m.ResourceKind
-	labels["environment_unique_name"] = m.EnvUniqueName
-	labels["cluster_id"] = m.ClusterID
+	labels["resource_name"] = sanitizeLabelValue(m.ResourceName)
+	labels["resource_kind"] = sanitizeLabelValue(m.ResourceKind)
+	labels["environment_unique_name"] = sanitizeLabelValue(m.EnvUniqueName)
+	labels["cluster_id"] = sanitizeLabelValue(m.ClusterID)
 	labels["cloud_action"] = formatBool(m.IsCloudAction)
 
 	return labels
+}
+
+// DisplayNameAnnotation carries the RAW display name, which the label cannot.
+//
+// Sanitizing display_name made the label lossy ("Stop Database" -> Stop-Database),
+// and ImportState reconstructs `name` from it -- so import produced a spurious
+// "Stop-Database" -> "Stop Database" diff on the first plan. Annotations have no
+// charset restriction, so the exact value round-trips while the label stays valid.
+const DisplayNameAnnotation = "facets.cloud/display-name"
+
+// Annotations returns metadata that must survive verbatim and so cannot live in a
+// label.
+func (m *ResourceMetadata) Annotations() map[string]string {
+	return map[string]string{
+		DisplayNameAnnotation: m.DisplayName,
+	}
+}
+
+// AnnotationsAsInterface returns Annotations for unstructured objects.
+func (m *ResourceMetadata) AnnotationsAsInterface() map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range m.Annotations() {
+		out[k] = v
+	}
+	return out
 }
 
 // LabelsAsInterface returns labels as map[string]interface{} for unstructured objects

@@ -360,7 +360,7 @@ func (r *TektonActionAWSResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 	// Build Task
-	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -598,7 +598,7 @@ func (r *TektonActionAWSResource) Update(ctx context.Context, req resource.Updat
 		return
 	}
 	// Build Task
-	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface())
+	task := r.buildAWSTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -739,7 +739,14 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 		return
 	}
 
-	displayName, hasDisplayName := labels["display_name"]
+	// Prefer the annotation: the display_name label is sanitized and therefore
+	// lossy, so reconstructing `name` from it produces a spurious first-plan diff.
+	// Fall back to the label for Tasks created before the annotation existed.
+	annotations := task.GetAnnotations()
+	displayName, hasDisplayName := annotations[tekton.DisplayNameAnnotation]
+	if !hasDisplayName || displayName == "" {
+		displayName, hasDisplayName = labels["display_name"]
+	}
 	resourceName, hasResourceName := labels["resource_name"]
 	_, hasResourceKind := labels["resource_kind"]
 	_, hasEnvUniqueName := labels["environment_unique_name"]
@@ -775,7 +782,7 @@ func (r *TektonActionAWSResource) ImportState(ctx context.Context, req resource.
 }
 
 // buildAWSTask creates the Tekton Task for AWS workflows
-func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonActionAWSResourceModel, labels map[string]interface{}) *unstructured.Unstructured {
+func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonActionAWSResourceModel, labels, annotations map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)
@@ -821,5 +828,6 @@ func (r *TektonActionAWSResource) buildAWSTask(ctx context.Context, plan TektonA
 		Namespace:   tektonPipelinesNamespace,
 		Description: description,
 		Labels:      labels,
+		Annotations: annotations,
 	}, tektonSteps, taskParams)
 }

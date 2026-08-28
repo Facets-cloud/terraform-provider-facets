@@ -13,6 +13,24 @@ type TaskSpec struct {
 	Namespace   string
 	Description string
 	Labels      map[string]interface{}
+	// Annotations carries values that must survive verbatim and therefore cannot
+	// live in a label -- notably the raw display name, which ImportState reads back
+	// to reconstruct `name`. Optional: nil is omitted entirely.
+	Annotations map[string]interface{}
+}
+
+// metadataWithAnnotations builds the object metadata, omitting annotations when
+// none are supplied so existing objects are not given an empty map.
+func metadataWithAnnotations(spec TaskSpec) map[string]interface{} {
+	md := map[string]interface{}{
+		"name":      spec.TaskName,
+		"namespace": spec.Namespace,
+		"labels":    spec.Labels,
+	}
+	if len(spec.Annotations) > 0 {
+		md["annotations"] = spec.Annotations
+	}
+	return md
 }
 
 // BuildStepWithResources builds a Tekton step with environment variables and compute resources
@@ -96,11 +114,7 @@ func BuildTask(spec TaskSpec, steps []interface{}, params []interface{}) *unstru
 		Object: map[string]interface{}{
 			"apiVersion": "tekton.dev/v1beta1",
 			"kind":       "Task",
-			"metadata": map[string]interface{}{
-				"name":      spec.TaskName,
-				"namespace": spec.Namespace,
-				"labels":    spec.Labels,
-			},
+			"metadata":   metadataWithAnnotations(spec),
 			"spec": map[string]interface{}{
 				"description": description,
 				"steps":       steps,
