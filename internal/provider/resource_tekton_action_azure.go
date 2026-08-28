@@ -391,7 +391,9 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 	// stay an implementation detail: nobody has to be told a name, because nobody
 	// has to type one. See ReconcileCredentialsSecret for why the Secret is shared
 	// rather than owned by a single action.
-	if azureConfig.Mode == azure.AuthModeClientSecret {
+	// Unconditional: client-secret is the only auth mode, so there is nothing to
+	// branch on. A `Mode ==` guard here would read as a live check that can fail.
+	{
 		if err := operations.ReconcileCredentialsSecret(
 			ctx, plan.Namespace.ValueString(),
 			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
@@ -421,7 +423,7 @@ func (r *TektonActionAzureResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface(), azureConfig.Mode)
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -515,7 +517,7 @@ func (r *TektonActionAzureResource) Read(ctx context.Context, req resource.ReadR
 	// Create/Update still surface a hard error on the paths that can.
 	if r.providerData != nil && !r.providerData.Azure.IsNull() {
 		azureConfig, cfgErr := azure.GetAzureConfig(ctx, &azure.ProviderModel{Azure: r.providerData.Azure})
-		if cfgErr == nil && azureConfig.Mode == azure.AuthModeClientSecret {
+		if cfgErr == nil {
 			operations := tekton.NewResourceOperations(client)
 			if secErr := operations.ReconcileCredentialsSecret(
 				ctx, state.Namespace.ValueString(),
@@ -697,7 +699,9 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 	// Reconcile on update too, so a rotated client secret propagates: the Secret is
 	// rewritten in place under the same derived name, and every action sharing that
 	// service principal picks up the new value on its next run.
-	if azureConfig.Mode == azure.AuthModeClientSecret {
+	// Unconditional: client-secret is the only auth mode, so there is nothing to
+	// branch on. A `Mode ==` guard here would read as a live check that can fail.
+	{
 		if err := operations.ReconcileCredentialsSecret(
 			ctx, plan.Namespace.ValueString(),
 			azureConfig.SecretName, azureConfig.SecretKey, azureConfig.ClientSecret,
@@ -726,7 +730,7 @@ func (r *TektonActionAzureResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 	// Build Task
-	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface(), azureConfig.Mode)
+	task := r.buildAzureTask(ctx, plan, metadata.LabelsAsInterface(), metadata.AnnotationsAsInterface())
 
 	resp.Diagnostics.Append(r.updateResources(ctx, operations, stepAction, task)...)
 	if resp.Diagnostics.HasError() {
@@ -960,7 +964,7 @@ func (r *TektonActionAzureResource) ImportState(ctx context.Context, req resourc
 }
 
 // buildAzureTask creates the Tekton Task for Azure workflows
-func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels, annotations map[string]interface{}, azureMode azure.AuthMode) *unstructured.Unstructured {
+func (r *TektonActionAzureResource) buildAzureTask(ctx context.Context, plan TektonActionAzureResourceModel, labels, annotations map[string]interface{}) *unstructured.Unstructured {
 	// Build steps
 	var steps []tekton.StepModel
 	plan.Steps.ElementsAs(ctx, &steps, false)

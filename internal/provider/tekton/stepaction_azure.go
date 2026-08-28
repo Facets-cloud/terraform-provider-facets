@@ -24,15 +24,6 @@ const AzureConfigDir = "/workspace/.azure"
 // switched back so all three action types share one image.
 const AzureSetupImage = "mcr.microsoft.com/azure-cli:2.61.0"
 
-// AzureFetchImage runs the secret-manager fetch step. It must contain the aws CLI
-// and jq; the azure-cli image has jq but no aws (and no boto3), so the shared
-// Facets base image is used instead.
-const AzureFetchImage = "facetscloud/actions-base-image:v1.0.0"
-
-// AzureLoginStepName is the name of the step that performs `az login` in
-// secret-manager mode, injected after the credential fetch.
-const AzureLoginStepName = "azure-login"
-
 // BuildAzureStepAction creates a StepAction that authenticates the Azure CLI so
 // that subsequent user steps can call `az ...` without handling credentials
 // themselves.
@@ -81,17 +72,18 @@ func BuildAzureStepAction(stepActionName, namespace string, labels map[string]in
 	}, nil
 }
 
-// The Kubernetes Secret that client-secret mode reads from is created OUT OF
-// BAND (e.g. by a k8s_resource module) -- this provider only references it, so
-// the value never appears in the rendered Task manifest. Its name and key are
-// configurable via the provider block; see azure.DefaultCredentialsSecretName.
-
-// GenerateAzureLoginScript renders the credential-setup script.
+// GenerateAzureLoginScript renders the credential-setup script: an `az login` as
+// the configured service principal, followed by `az account set`.
 //
-// OIDC federation is preferred: Microsoft Entra ID exchanges the pod's projected
-// service-account token for an Azure token, so no secret exists anywhere. This is
-// the Azure analogue of the AWS IRSA flow and works cross-cloud, which matters
-// when the Tekton pod runs in EKS while the target resources live in Azure.
+// The password is NOT interpolated into the script. It arrives in the pod through
+// the FACETS_AZURE_CLIENT_SECRET environment variable, sourced via secretKeyRef
+// from a Kubernetes Secret that THIS PROVIDER creates and maintains (see
+// ResourceOperations.ReconcileCredentialsSecret). The Secret's name is derived
+// from the service principal identity, so nobody has to be told it; the
+// secret_name/secret_key provider fields exist only to pin an existing Secret.
+//
+// Consequently the value never appears in the rendered Task or StepAction
+// manifest, nor in Terraform state.
 // shellQuote renders v as a single-quoted POSIX shell word, safe to interpolate
 // into a generated script.
 //

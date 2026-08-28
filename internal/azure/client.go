@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
@@ -174,13 +173,4 @@ func requiredString(v types.String, name string) (string, error) {
 		return "", fmt.Errorf("%s is required in the azure block of the provider configuration", name)
 	}
 	return v.ValueString(), nil
-}
-
-func firstNonEmptyEnv(names ...string) string {
-	for _, n := range names {
-		if v := os.Getenv(n); v != "" {
-			return v
-		}
-	}
-	return ""
 }

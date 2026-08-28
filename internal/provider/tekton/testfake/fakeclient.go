@@ -28,8 +28,9 @@ var (
 		Version:  "v1beta1",
 		Resource: "tasks",
 	}
-	// ConfigMapGVR is core/v1 ConfigMaps -- Tekton's config-defaults is read to
-	// determine whether OIDC federation can work at all.
+	// ConfigMapGVR is core/v1 ConfigMaps. Registered in gvrToListKind so a LIST on
+	// configmaps does not panic in tests; no production path reads them since the
+	// OIDC-federation precondition check was removed with that mode.
 	ConfigMapGVR = schema.GroupVersionResource{
 		Group:    "",
 		Version:  "v1",
