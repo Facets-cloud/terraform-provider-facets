@@ -74,19 +74,20 @@ type FacetsActionsResource struct {
 }
 
 type FacetsActionsResourceModel struct {
-	ID                 types.String `tfsdk:"id"`
-	Name               types.String `tfsdk:"name"`
-	Description        types.String `tfsdk:"description"`
-	FacetsResourceName types.String `tfsdk:"facets_resource_name"`
-	FacetsEnvironment  types.Object `tfsdk:"facets_environment"`
-	FacetsResource     types.Object `tfsdk:"facets_resource"`
-	Namespace          types.String `tfsdk:"namespace"`
-	CloudAction        types.Bool   `tfsdk:"cloud_action"`
-	Labels             types.Map    `tfsdk:"labels"`
-	Steps              types.List   `tfsdk:"steps"`
-	Params             types.List   `tfsdk:"params"`
-	TaskName           types.String `tfsdk:"task_name"`
-	CredentialsSecret  types.String `tfsdk:"credentials_secret"`
+	ID                    types.String `tfsdk:"id"`
+	Name                  types.String `tfsdk:"name"`
+	Description           types.String `tfsdk:"description"`
+	FacetsResourceName    types.String `tfsdk:"facets_resource_name"`
+	FacetsEnvironment     types.Object `tfsdk:"facets_environment"`
+	FacetsResource        types.Object `tfsdk:"facets_resource"`
+	Namespace             types.String `tfsdk:"namespace"`
+	CloudAction           types.Bool   `tfsdk:"cloud_action"`
+	Labels                types.Map    `tfsdk:"labels"`
+	Steps                 types.List   `tfsdk:"steps"`
+	Params                types.List   `tfsdk:"params"`
+	TaskName              types.String `tfsdk:"task_name"`
+	CredentialsSecretName types.String `tfsdk:"credentials_secret_name"`
+	CredentialsSecret     types.String `tfsdk:"credentials_secret"`
 }
 
 func (r *FacetsActionsResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -251,9 +252,18 @@ func (r *FacetsActionsResource) Schema(ctx context.Context, req resource.SchemaR
 				Description: "Generated Task name: a hash of resource name, environment and action name",
 				Computed:    true,
 			},
+			"credentials_secret_name": schema.StringAttribute{
+				Description: "Name of an EXISTING Secret to attach to every step, for credentials that " +
+					"come from somewhere other than the provider's environment -- a secret manager, a " +
+					"Secret created by another resource, or one provisioned out of band. The provider " +
+					"only references it and never writes to it, so its contents are managed entirely by " +
+					"whoever created it. When set, credentials in the provider's environment are ignored.",
+				Optional: true,
+			},
 			"credentials_secret": schema.StringAttribute{
-				Description: "Name of the Secret holding this environment's action credentials. Only the " +
-					"name is stored -- never the credential values.",
+				Description: "Name of the Secret actually attached to the steps: either " +
+					"credentials_secret_name, or one derived from the environment when the provider " +
+					"manages credentials itself. The name only -- never the credential values.",
 				Computed: true,
 			},
 		},
@@ -458,12 +468,13 @@ func (r *FacetsActionsResource) ImportState(ctx context.Context, req resource.Im
 	envUnique := labels["environment_unique_name"]
 
 	state := FacetsActionsResourceModel{
-		ID:                 types.StringValue(namespace + "/" + taskName),
-		Namespace:          types.StringValue(namespace),
-		TaskName:           types.StringValue(taskName),
-		FacetsResourceName: types.StringValue(labels["resource_name"]),
-		CloudAction:        types.BoolValue(labels["cloud_action"] == "true"),
-		CredentialsSecret:  types.StringValue(credentialsSecretName(envUnique)),
+		ID:                    types.StringValue(namespace + "/" + taskName),
+		Namespace:             types.StringValue(namespace),
+		TaskName:              types.StringValue(taskName),
+		FacetsResourceName:    types.StringValue(labels["resource_name"]),
+		CloudAction:           types.BoolValue(labels["cloud_action"] == "true"),
+		CredentialsSecret:     types.StringValue(credentialsSecretName(envUnique)),
+		CredentialsSecretName: types.StringNull(),
 	}
 
 	resp.Diagnostics.AddWarning("Partial import",
@@ -482,6 +493,12 @@ func (r *FacetsActionsResource) reconcileCredentials(
 	ctx context.Context, ops *tekton.ResourceOperations, m *FacetsActionsResourceModel, soft bool,
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
+
+	// An externally supplied Secret is owned by whoever created it. Writing to it
+	// would clobber credentials this provider did not put there.
+	if !m.CredentialsSecretName.IsNull() && m.CredentialsSecretName.ValueString() != "" {
+		return diags
+	}
 
 	creds, err := r.creds()
 	if err != nil {
@@ -541,7 +558,13 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 	plan.Namespace = types.StringValue(namespace)
 	plan.TaskName = types.StringValue(names.TaskName)
 	plan.ID = types.StringValue(namespace + "/" + names.TaskName)
-	plan.CredentialsSecret = types.StringValue(credentialsSecretName(env.UniqueName.ValueString()))
+	// An explicitly named Secret wins: the module knows where its credentials come
+	// from, and the provider is not required to have any of its own.
+	if !plan.CredentialsSecretName.IsNull() && plan.CredentialsSecretName.ValueString() != "" {
+		plan.CredentialsSecret = plan.CredentialsSecretName
+	} else {
+		plan.CredentialsSecret = types.StringValue(credentialsSecretName(env.UniqueName.ValueString()))
+	}
 
 	customLabels := map[string]string{}
 	if !plan.Labels.IsNull() {
@@ -572,14 +595,18 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 
 	// Attach the Secret only when credentials exist. Referencing a Secret that
 	// was never created would leave every pod stuck in CreateContainerConfigError.
-	creds, err := r.creds()
-	if err != nil {
-		diags.AddError("Invalid action credentials in the environment", err.Error())
-		return nil, diags
-	}
 	secretForSteps := ""
-	if len(creds) > 0 {
-		secretForSteps = plan.CredentialsSecret.ValueString()
+	if !plan.CredentialsSecretName.IsNull() && plan.CredentialsSecretName.ValueString() != "" {
+		secretForSteps = plan.CredentialsSecretName.ValueString()
+	} else {
+		creds, err := r.creds()
+		if err != nil {
+			diags.AddError("Invalid action credentials in the environment", err.Error())
+			return nil, diags
+		}
+		if len(creds) > 0 {
+			secretForSteps = plan.CredentialsSecret.ValueString()
+		}
 	}
 
 	tektonSteps := make([]interface{}, 0, len(steps))
