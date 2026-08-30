@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`facets_actions`** — one action resource for every cloud, replacing the need for a separate resource type per provider.
+
+  **Credentials no longer pass through Terraform.** The provider reads them from its own process environment (variables prefixed `FACETS_ACTION_CRED_`), writes them to a Kubernetes Secret, and attaches that Secret to every step with `envFrom`. Each key arrives in the pod under its own name.
+
+  ```
+  runner env  ->  provider (os.Environ)  ->  Secret  ->  envFrom  ->  step env
+  ```
+
+  This matters because Terraform persists module outputs and resource attributes to state in plain text, and `sensitive = true` only redacts CLI output — it does not keep a value out of the state file. A credential routed through HCL, including one arriving via a `cloud_account` module output, is therefore written to state. Reading from the environment means Terraform never observes the value at all. The schema offers no attribute that could hold one.
+
+  **Cloud-agnostic by construction.** Because `envFrom` injects a Secret's keys verbatim, the provider never learns what any of them mean. AWS static keys, an assumed-role session, an Azure service principal, Azure managed identity settings and a GCP service account all travel the same path; the module's own script performs whatever login its cloud requires.
+
+  **No StepAction.** That object existed only to inject credentials, and it cannot be made cloud-agnostic: Tekton rejects `env` on a step carrying a `ref` (*"env cannot be used with Ref"*), and `StepActionSpec` has no `envFrom` field. Managing one object instead of two removes the create-rollback, the two-object drift detection, and the partial-failure states that come with keeping a pair in sync.
+
+  Other details:
+  - `cloud_action` is now an explicit argument rather than being implied by the resource type, so an action that mutates cloud infrastructure can be gated on `RUN_CLOUD_ACTION` regardless of which cloud it targets.
+  - Credential names must be valid C identifiers. Kubernetes injects Secret keys verbatim as variable names and silently skips the rest, reporting it only as a pod event; the provider rejects them at apply time instead.
+  - The credentials Secret is scoped to an environment and shared by its actions, so rotation touches one object. Reconciliation compares before writing, so a plan against unchanged credentials performs no write.
+  - Rotation converges through `Read`: credentials appear in no attribute, so nothing would otherwise prompt Terraform to call `Update`.
+  - `name` is not reconstructed on import from the `display_name` label, which is sanitized and cannot round-trip a name containing rejected characters.
+
+### Fixed
+- **An action name containing a space failed the entire apply**, and the same was true of a resource name, kind or environment name. `display_name`, `resource_name`, `resource_kind`, `environment_unique_name` and `cluster_id` were all written to Kubernetes labels unmodified, so any space or other rejected character produced `metadata.labels: Invalid value`. All generated label values are now sanitized, as are user-supplied label keys and values, asserted against Kubernetes' own `IsValidLabelValue` and `IsQualifiedName`. **This affected `facets_tekton_action_aws` and `facets_tekton_action_kubernetes` and predates this release.**
+
+  Sanitization is lossy but injective: a value that strips to nothing (a name in a non-Latin script) or that exceeds 63 characters falls back to a digest suffix, so two distinct names never collapse onto one label.
+
+### Compatibility
+Additive. `facets_tekton_action_aws` and `facets_tekton_action_kubernetes` are unchanged apart from the label fix above, which turns a previously failing configuration into a working one. No schema changes to existing resources.
+
 ## [1.2.1] - 2026-05-14
 
 ### Fixed

@@ -28,6 +28,14 @@ var (
 		Version:  "v1beta1",
 		Resource: "tasks",
 	}
+	// SecretGVR is the core Secret resource, used by the cloud-agnostic action
+	// resource to store credentials collected from the provider's environment.
+	SecretGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "secrets",
+	}
+
 	StepActionGVR = schema.GroupVersionResource{
 		Group:    "tekton.dev",
 		Version:  "v1beta1",
@@ -38,6 +46,7 @@ var (
 // gvrToListKind maps the Tekton GVRs to their list kind. NewSimpleDynamicClient
 // requires this for unstructured types not registered in any scheme.
 var gvrToListKind = map[schema.GroupVersionResource]string{
+	SecretGVR:     "SecretList",
 	TaskGVR:       "TaskList",
 	StepActionGVR: "StepActionList",
 }
