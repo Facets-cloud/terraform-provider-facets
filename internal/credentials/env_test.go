@@ -81,3 +81,26 @@ func TestFromEnviron_EmptyIsNotAnError(t *testing.T) {
 		t.Errorf("expected an empty non-nil map, got %v", got)
 	}
 }
+
+// A credential declared on a resource must fail the same way as one exported to
+// the runner -- otherwise one of the two paths silently accepts a name
+// Kubernetes will skip.
+func TestValidateNames_MatchesEnvRules(t *testing.T) {
+	if err := ValidateNames(map[string]string{"AZURE_CLIENT_ID": "a", "_OK": "b"}); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	for _, bad := range []string{"AZURE-CLIENT-ID", "1ST", "has.dot", "has space"} {
+		t.Run(bad, func(t *testing.T) {
+			err := ValidateNames(map[string]string{bad: "v"})
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", bad)
+			}
+			if !strings.Contains(err.Error(), bad) {
+				t.Errorf("error should name the offending key, got: %v", err)
+			}
+		})
+	}
+	if err := ValidateNames(map[string]string{}); err != nil {
+		t.Errorf("empty map should be fine: %v", err)
+	}
+}

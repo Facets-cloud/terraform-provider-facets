@@ -86,6 +86,7 @@ type FacetsActionsResourceModel struct {
 	Steps                 types.List   `tfsdk:"steps"`
 	Params                types.List   `tfsdk:"params"`
 	TaskName              types.String `tfsdk:"task_name"`
+	Credentials           types.Map    `tfsdk:"credentials"`
 	CredentialsSecretName types.String `tfsdk:"credentials_secret_name"`
 	CredentialsSecret     types.String `tfsdk:"credentials_secret"`
 }
@@ -252,6 +253,22 @@ func (r *FacetsActionsResource) Schema(ctx context.Context, req resource.SchemaR
 				Description: "Generated Task name: a hash of resource name, environment and action name",
 				Computed:    true,
 			},
+			"credentials": schema.MapAttribute{
+				Description: "Cloud credentials as name => value, which the provider writes to a " +
+					"Kubernetes Secret and attaches to every step with envFrom. Opaque to the " +
+					"provider: whatever keys are supplied arrive in the pod under the same names, so " +
+					"AWS keys, an Azure service principal and a GCP service account all work here.\n\n" +
+					"Intended for wiring a cloud_account input directly, e.g. " +
+					"AZURE_CLIENT_SECRET = var.inputs.cloud_account.attributes.client_secret.\n\n" +
+					"Values do NOT appear in the rendered Task -- the Task carries only a secretRef. " +
+					"They ARE persisted in Terraform state, because a resource attribute always is " +
+					"before Terraform 1.11's write-only arguments; on 1.11+ prefer those, and where " +
+					"the credential must never transit Terraform at all use credentials_secret_name " +
+					"or the provider's own environment instead.",
+				Optional:    true,
+				Sensitive:   true,
+				ElementType: types.StringType,
+			},
 			"credentials_secret_name": schema.StringAttribute{
 				Description: "Name of an EXISTING Secret to attach to every step, for credentials that " +
 					"come from somewhere other than the provider's environment -- a secret manager, a " +
@@ -288,7 +305,21 @@ func (r *FacetsActionsResource) client() (dynamic.Interface, *tekton.ResourceOpe
 	return c, tekton.NewResourceOperations(c), nil
 }
 
-func (r *FacetsActionsResource) creds() (map[string]string, error) {
+// creds resolves the credentials to store, preferring those declared on the
+// resource over the provider's environment. A module that wires its cloud_account
+// input in knows exactly which account the action should act as; the environment
+// is the fallback for runners configured centrally.
+func (r *FacetsActionsResource) creds(ctx context.Context, m *FacetsActionsResourceModel) (map[string]string, error) {
+	if m != nil && !m.Credentials.IsNull() && !m.Credentials.IsUnknown() {
+		out := map[string]string{}
+		if diags := m.Credentials.ElementsAs(ctx, &out, false); diags.HasError() {
+			return nil, fmt.Errorf("reading credentials: %v", diags.Errors())
+		}
+		if err := credentials.ValidateNames(out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
 	if r.credsFromEnv != nil {
 		return r.credsFromEnv()
 	}
@@ -500,9 +531,9 @@ func (r *FacetsActionsResource) reconcileCredentials(
 		return diags
 	}
 
-	creds, err := r.creds()
+	creds, err := r.creds(ctx, m)
 	if err != nil {
-		diags.AddError("Invalid action credentials in the environment", err.Error())
+		diags.AddError("Invalid action credentials", err.Error())
 		return diags
 	}
 	if len(creds) == 0 {
@@ -599,7 +630,7 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 	if !plan.CredentialsSecretName.IsNull() && plan.CredentialsSecretName.ValueString() != "" {
 		secretForSteps = plan.CredentialsSecretName.ValueString()
 	} else {
-		creds, err := r.creds()
+		creds, err := r.creds(ctx, plan)
 		if err != nil {
 			diags.AddError("Invalid action credentials in the environment", err.Error())
 			return nil, diags

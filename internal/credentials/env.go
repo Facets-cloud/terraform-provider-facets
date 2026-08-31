@@ -80,6 +80,28 @@ func fromEnviron(environ []string) (map[string]string, error) {
 	return out, nil
 }
 
+// ValidateNames rejects credential names Kubernetes would silently skip.
+//
+// Shares the rule with FromEnv so a credential declared on a resource fails the
+// same way as one exported to the runner, rather than only being caught on one
+// of the two paths.
+func ValidateNames(creds map[string]string) error {
+	var invalid []string
+	for k := range creds {
+		if !cIdentifier.MatchString(k) {
+			invalid = append(invalid, k)
+		}
+	}
+	if len(invalid) > 0 {
+		sort.Strings(invalid)
+		return fmt.Errorf(
+			"credential names must be valid C identifiers (letters, digits and underscore, not starting "+
+				"with a digit) because Kubernetes injects Secret keys verbatim as environment variable "+
+				"names and silently skips the rest; rejected: %s", strings.Join(invalid, ", "))
+	}
+	return nil
+}
+
 // SortedKeys returns the credential names in a stable order. Used for logging and
 // for anything rendered into a manifest -- Go map iteration is randomised, and an
 // unstable order produces a spurious diff on every plan.
