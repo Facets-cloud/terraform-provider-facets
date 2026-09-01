@@ -18,29 +18,22 @@ The Task carries only a `secretRef`, so no credential is readable by anyone with
 
 Terraform persists module outputs and resource attributes to state in plain text. `sensitive = true` only redacts CLI output — [it does not keep a value out of the state file](https://developer.hashicorp.com/terraform/language/state/sensitive-data). So any credential routed through HCL, including one arriving via a module output, ends up in state.
 
-A credential supplied through the provider's own environment (source 3) is never observed by Terraform, so there is nothing for it to persist. One named in an existing Secret (source 1) never carries a value through Terraform either. One set on the `credentials` attribute (source 2) does.
+A credential supplied through the provider's own environment (source 2) is never observed by Terraform, so there is nothing for it to persist. One set on the `credentials` attribute (source 1) does.
 
 ## Supplying credentials
 
-Three sources, in precedence order. Only the first and third keep the credential out of Terraform state.
+Two sources, in precedence order.
 
 | # | Source | Credential in state | Status |
 |---|---|---|---|
-| 1 | `credentials_secret_name` — a Secret you already created | No, name only | Verified |
-| 2 | `credentials` — a map on the resource | **Yes** | Verified |
-| 3 | `FACETS_ACTION_CRED_*` in the provider's environment | No | **Prerequisite, see below** |
+| 1 | `credentials` — a map on the resource, set by the module | **Yes** | Verified |
+| 2 | `FACETS_ACTION_CRED_*` in the provider's environment | No | **Prerequisite, see below** |
 
-Whichever supplies the values, the provider writes them to one Kubernetes Secret per environment, named `facets-action-creds-<hash>`, and attaches it to every step with `envFrom`. Only the name reaches Terraform state.
+Either way the provider writes the values to one Kubernetes Secret per environment, named `facets-action-creds-<hash>`, and attaches it to every step with `envFrom`. Only the name reaches Terraform state.
 
-### 1. An existing Secret
+Credentials are meant to be supplied by the **module**, not by whoever configures the resource. A module derives them from its own `cloud_account` input, so nothing credential-shaped appears in the blueprint spec or the UI form.
 
-```hcl
-credentials_secret_name = "my-cloud-creds"
-```
-
-The provider only references it and never writes to it, so the contents stay owned by whoever created it — a secret-manager sync, another Terraform resource, or an out-of-band step. Use this where the credential must not transit Terraform at all and option 3 is unavailable.
-
-### 2. Values on the resource
+### 1. Values from the module
 
 ```hcl
 credentials = {
@@ -49,14 +42,14 @@ credentials = {
 }
 ```
 
-Convenient — a module wires its own `cloud_account` input and the user configures nothing. The values do **not** appear in the rendered Task, which carries only a `secretRef`, but they **are** written to Terraform state: a resource attribute always is, before Terraform 1.11's write-only arguments, and `sensitive = true` only redacts CLI output. On Terraform 1.11+ this attribute should become write-only, which removes that exposure without changing any module.
+The module owns the mapping, so an AWS module emits `AWS_*` from its own cloud account and a GCP one emits `GOOGLE_*`. The user configures nothing. The values do **not** appear in the rendered Task, which carries only a `secretRef`, but they **are** written to Terraform state: a resource attribute always is, before Terraform 1.11's write-only arguments, and `sensitive = true` only redacts CLI output. On Terraform 1.11+ this attribute should become write-only, which removes that exposure without changing any module.
 
-### 3. The provider's environment
+### 2. The provider's environment
 
 > [!IMPORTANT]
 > **Prerequisite: the Terraform runner must already export these variables, and this path has not been exercised end to end.**
 >
-> On a Facets control plane the runner's environment is a fixed set. Arbitrary variables reach it only through cluster-scoped Terraform run configuration (`additionalEnvVars`), which is control-plane administration and is not exposed by the `raptor` CLI. Without that, no `FACETS_ACTION_CRED_*` variable is present and the provider falls through to sources 1 and 2.
+> On a Facets control plane the runner's environment is a fixed set. Arbitrary variables reach it only through cluster-scoped Terraform run configuration (`additionalEnvVars`), which is control-plane administration and is not exposed by the `raptor` CLI. Without that, no `FACETS_ACTION_CRED_*` variable is present and the provider falls back to the `credentials` attribute.
 >
 > The code path is unit-tested; it has not been run against a live control plane. Treat it as the intended end state rather than a supported option today.
 
@@ -77,7 +70,7 @@ Credentials are scoped to an environment, so every action in one environment sha
 
 ## Rotation
 
-Under sources 1 and 3 the credential appears in no attribute, so nothing changes when it rotates and Terraform would never call `Update`. The resource therefore reconciles the Secret during `Read` as well.
+Under source 2 the credential appears in no attribute, so nothing changes when it rotates and Terraform would never call `Update`. The resource therefore reconciles the Secret during `Read` as well.
 
 The reconcile compares before writing, so a plan against unchanged credentials performs no write and needs no update permission. When the values differ, the next plan or apply converges them.
 
@@ -159,7 +152,7 @@ Together those mean a StepAction can only carry credentials whose names the prov
 
 - `id` — `<namespace>/<task_name>`.
 - `task_name` — generated Task name, a hash of resource name, environment and action name.
-- `credentials_secret` — name of the Secret holding the environment's credentials. The name only; never the values.
+- `credentials_secret` — name of the Secret the provider maintains for this environment. The name only; never the values.
 
 ## Import
 

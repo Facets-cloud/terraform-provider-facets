@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`facets_actions`** — one action resource for every cloud, replacing the need for a separate resource type per provider.
 
-  **Credentials never reach the rendered Task.** Whatever supplies them, the provider writes them to a Kubernetes Secret and attaches it to every step with `envFrom`, so the Task carries only a `secretRef`. Three sources, in precedence order: `credentials_secret_name` (a Secret you already created), the `credentials` map on the resource, and variables prefixed `FACETS_ACTION_CRED_` in the provider's own environment.
+  **Credentials never reach the rendered Task.** Whatever supplies them, the provider writes them to a Kubernetes Secret and attaches it to every step with `envFrom`, so the Task carries only a `secretRef`. Two sources, in precedence order: the `credentials` map on the resource, which a module fills from its own `cloud_account` input, and variables prefixed `FACETS_ACTION_CRED_` in the provider's own environment.
 
-  Only the first and third also keep the value out of **Terraform state** — a resource attribute is always persisted before Terraform 1.11's write-only arguments, and `sensitive = true` only redacts CLI output.
+  Only the second also keeps the value out of **Terraform state** — a resource attribute is always persisted before Terraform 1.11's write-only arguments, and `sensitive = true` only redacts CLI output.
 
   The environment source carries a prerequisite: on a Facets control plane the Terraform runner's environment is a fixed set, and arbitrary variables reach it only through cluster-scoped run configuration that the `raptor` CLI does not expose. That path is unit-tested but has not been exercised against a live control plane; the other two have.
 
