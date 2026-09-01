@@ -140,7 +140,7 @@ Together those mean a StepAction can only carry credentials whose names the prov
 - `description` — what the action does.
 - `cloud_action` — whether the action mutates cloud infrastructure. Sets the `cloud_action` label, which decides whether Facets requires `RUN_CLOUD_ACTION` rather than `RUN_ACTION`. **Set it `true` for anything changing state outside the cluster**; the default of `false` grants the weaker permission.
 - `namespace` — defaults to `tekton-pipelines`. Changing it forces replacement.
-- `labels` — extra labels, merged with the generated ones, which win on conflict. Keys and values are sanitized to what Kubernetes accepts.
+- `labels` — extra labels, merged with the generated ones, which win on conflict. Keys and values are sanitized to what Kubernetes accepts; see [Label sanitization](#label-sanitization).
 - `params` — list of `{ name, type }`; type is `string`, `array` or `object`.
 
 ### Optional step arguments
@@ -153,6 +153,18 @@ Together those mean a StepAction can only carry credentials whose names the prov
 - `id` — `<namespace>/<task_name>`.
 - `task_name` — generated Task name, a hash of resource name, environment and action name.
 - `credentials_secret` — name of the Secret the provider maintains for this environment. The name only; never the values.
+
+## Label sanitization
+
+Generated labels — `display_name`, `resource_name`, `resource_kind`, `environment_unique_name`, `cluster_id` — carry human-authored strings from a blueprint, and Kubernetes rejects most of what people type. An action called `Stop Database` used to fail the entire apply with `metadata.labels: Invalid value`. Values are now coerced to at most 63 characters of `[A-Za-z0-9._-]`, beginning and ending alphanumeric; user-supplied label keys and values are coerced too.
+
+Two properties are worth relying on:
+
+**A value Kubernetes already accepts is returned untouched.** Sanitization only transforms input that would otherwise fail. This matters because the same code runs for `facets_tekton_action_aws` and `facets_tekton_action_kubernetes`, so every action that works today keeps the identical label — no in-place Task update, and nothing that resolves an action by `display_name` starts missing. `restart--db` stays `restart--db`.
+
+**Distinct names never collapse onto one label.** A value that strips to nothing — a name in a non-Latin script, or pure punctuation — or one exceeding 63 characters falls back to a digest suffix rather than to `""` or a bare truncation.
+
+The transformation is lossy, so the label is not a way to recover the original name. `name` is deliberately not reconstructed from it on import for that reason.
 
 ## Import
 
