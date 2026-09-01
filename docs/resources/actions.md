@@ -6,23 +6,61 @@ Manages a Tekton Task for a Facets action, for any cloud or none.
 
 The resource creates a single Tekton **Task** in the `tekton-pipelines` namespace (or one you choose). There is no StepAction — see [Why no StepAction](#why-no-stepaction).
 
-Cloud credentials never pass through Terraform. The provider reads them from its own process environment, writes them to a Kubernetes Secret, and attaches that Secret to every step with `envFrom`. Each key arrives in the pod as an environment variable under its own name, so the module's script performs whatever login its cloud requires.
+Cloud credentials are never configured on the provider and never appear in the rendered Task. The provider collects them, writes them to a Kubernetes Secret, and attaches that Secret to every step with `envFrom`. Each key arrives in the pod as an environment variable under its own name, so the module's script performs whatever login its cloud requires.
 
 ```
-runner env  ──►  provider (os.Environ)  ──►  Secret  ──►  envFrom  ──►  step env
+credential source  ──►  provider  ──►  Secret  ──►  envFrom  ──►  step env
 ```
 
-Nothing sensitive is written to Terraform state, the plan file, or the rendered Task.
+The Task carries only a `secretRef`, so no credential is readable by anyone with `kubectl` on the namespace. Whether the value also stays out of **Terraform state** depends on which of the three sources below supplies it.
 
-## Why credentials come from the environment
+## Why the source matters
 
 Terraform persists module outputs and resource attributes to state in plain text. `sensitive = true` only redacts CLI output — [it does not keep a value out of the state file](https://developer.hashicorp.com/terraform/language/state/sensitive-data). So any credential routed through HCL, including one arriving via a module output, ends up in state.
 
-Reading straight from the environment means Terraform never observes the value, so there is nothing for it to persist. The resource schema deliberately offers no attribute that could hold a credential.
+A credential supplied through the provider's own environment (source 3) is never observed by Terraform, so there is nothing for it to persist. One named in an existing Secret (source 1) never carries a value through Terraform either. One set on the `credentials` attribute (source 2) does.
 
 ## Supplying credentials
 
-Export any variables prefixed `FACETS_ACTION_CRED_` to the process running Terraform. The prefix is stripped:
+Three sources, in precedence order. Only the first and third keep the credential out of Terraform state.
+
+| # | Source | Credential in state | Status |
+|---|---|---|---|
+| 1 | `credentials_secret_name` — a Secret you already created | No, name only | Verified |
+| 2 | `credentials` — a map on the resource | **Yes** | Verified |
+| 3 | `FACETS_ACTION_CRED_*` in the provider's environment | No | **Prerequisite, see below** |
+
+Whichever supplies the values, the provider writes them to one Kubernetes Secret per environment, named `facets-action-creds-<hash>`, and attaches it to every step with `envFrom`. Only the name reaches Terraform state.
+
+### 1. An existing Secret
+
+```hcl
+credentials_secret_name = "my-cloud-creds"
+```
+
+The provider only references it and never writes to it, so the contents stay owned by whoever created it — a secret-manager sync, another Terraform resource, or an out-of-band step. Use this where the credential must not transit Terraform at all and option 3 is unavailable.
+
+### 2. Values on the resource
+
+```hcl
+credentials = {
+  AZURE_CLIENT_ID     = var.inputs.cloud_account.attributes.client_id
+  AZURE_CLIENT_SECRET = var.inputs.cloud_account.attributes.client_secret
+}
+```
+
+Convenient — a module wires its own `cloud_account` input and the user configures nothing. The values do **not** appear in the rendered Task, which carries only a `secretRef`, but they **are** written to Terraform state: a resource attribute always is, before Terraform 1.11's write-only arguments, and `sensitive = true` only redacts CLI output. On Terraform 1.11+ this attribute should become write-only, which removes that exposure without changing any module.
+
+### 3. The provider's environment
+
+> [!IMPORTANT]
+> **Prerequisite: the Terraform runner must already export these variables, and this path has not been exercised end to end.**
+>
+> On a Facets control plane the runner's environment is a fixed set. Arbitrary variables reach it only through cluster-scoped Terraform run configuration (`additionalEnvVars`), which is control-plane administration and is not exposed by the `raptor` CLI. Without that, no `FACETS_ACTION_CRED_*` variable is present and the provider falls through to sources 1 and 2.
+>
+> The code path is unit-tested; it has not been run against a live control plane. Treat it as the intended end state rather than a supported option today.
+
+Export any variable prefixed `FACETS_ACTION_CRED_` to the process running Terraform. The prefix is stripped:
 
 ```bash
 FACETS_ACTION_CRED_AWS_ACCESS_KEY_ID=AKIA...       →  AWS_ACCESS_KEY_ID
@@ -35,11 +73,11 @@ The provider does not interpret them. AWS static keys, an assumed-role session, 
 
 Names must be valid C identifiers — letters, digits and underscore, not starting with a digit. Kubernetes injects Secret keys verbatim as variable names and silently skips anything else, reporting it only as a pod event, so the provider rejects such names at apply time instead.
 
-Credentials are scoped to an environment, so every action in one environment shares a single Secret named `facets-action-creds-<hash>`. Only the name is stored in Terraform state.
+Credentials are scoped to an environment, so every action in one environment shares a single Secret. One credential, one rotation.
 
 ## Rotation
 
-Because credentials never appear in configuration, no attribute changes when they rotate and Terraform would never call `Update`. The resource therefore reconciles the Secret during `Read` as well.
+Under sources 1 and 3 the credential appears in no attribute, so nothing changes when it rotates and Terraform would never call `Update`. The resource therefore reconciles the Secret during `Read` as well.
 
 The reconcile compares before writing, so a plan against unchanged credentials performs no write and needs no update permission. When the values differ, the next plan or apply converges them.
 
