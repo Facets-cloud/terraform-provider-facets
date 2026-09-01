@@ -71,3 +71,33 @@ func TestSanitizeLabelValue_IsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// Sanitization must be a no-op on anything Kubernetes already accepts.
+//
+// The _aws and _kubernetes resources share this function, so a value that works
+// today must produce the identical label tomorrow. Rewriting one would force an
+// in-place Task update and break lookups that match on display_name --
+// "restart--db" collapsing to "restart-db" did exactly that before the guard.
+func TestSanitizeLabelValue_NoOpOnAlreadyValidValues(t *testing.T) {
+	for _, v := range []string{
+		"start-database", "stop-database", "rollout-restart-application",
+		"scale-up", "Scale_Down", "v1.2.3", "a", "restart--db", "a--b--c",
+		"ends.with.dot0", "UPPER_and_lower.mixed-1",
+	} {
+		if got := SanitizeLabelValue(v); got != v {
+			t.Errorf("already-valid %q was rewritten to %q", v, got)
+		}
+	}
+}
+
+// The same guarantee for keys, which the _aws and _kubernetes variants also emit.
+func TestSanitizeLabelKey_NoOpOnAlreadyValidKeys(t *testing.T) {
+	for _, k := range []string{
+		"display_name", "resource_name", "cloud_action",
+		"facets.cloud/release-type", "app.kubernetes.io/managed-by",
+	} {
+		if got := SanitizeLabelKey(k); got != k {
+			t.Errorf("already-valid key %q was rewritten to %q", k, got)
+		}
+	}
+}

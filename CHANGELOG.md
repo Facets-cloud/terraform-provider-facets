@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Sanitization is lossy but injective: a value that strips to nothing (a name in a non-Latin script) or that exceeds 63 characters falls back to a digest suffix, so two distinct names never collapse onto one label.
 
+  It is also a **no-op on anything Kubernetes already accepts**, so every action that works today keeps the identical label. Without that guard the transformation rewrote legal values — `restart--db` collapsed to `restart-db` — which would have forced an in-place Task update and broken lookups matching on `display_name`. Asserted by a regression test.
+
 ### Compatibility
 Additive. `facets_tekton_action_aws` and `facets_tekton_action_kubernetes` are unchanged apart from the label fix above, which turns a previously failing configuration into a working one. No schema changes to existing resources.
 

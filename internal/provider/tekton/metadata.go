@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // ResourceMetadata contains the metadata for a Tekton resource
@@ -131,6 +132,15 @@ func SanitizeLabelValue(v string) string {
 		return ""
 	}
 
+	// Leave anything Kubernetes already accepts exactly as it is. Without this
+	// guard the transformations below rewrite legal values -- "restart--db"
+	// collapses to "restart-db" -- which changes the label on actions that work
+	// today, forcing an in-place update and breaking lookups that match on
+	// display_name.
+	if len(validation.IsValidLabelValue(v)) == 0 {
+		return v
+	}
+
 	out := labelValueInvalid.ReplaceAllString(v, "-")
 	for strings.Contains(out, "--") {
 		out = strings.ReplaceAll(out, "--", "-")
@@ -155,6 +165,10 @@ func SanitizeLabelValue(v string) string {
 // SanitizeLabelKey coerces a string into a valid label key. Returns "" when
 // nothing usable remains, which the caller treats as "drop this label".
 func SanitizeLabelKey(k string) string {
+	if len(validation.IsQualifiedName(k)) == 0 {
+		return k
+	}
+
 	out := labelKeyInvalid.ReplaceAllString(k, "-")
 	for strings.Contains(out, "--") {
 		out = strings.ReplaceAll(out, "--", "-")
