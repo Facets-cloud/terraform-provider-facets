@@ -29,7 +29,9 @@ Two sources, in precedence order.
 | 1 | `credentials` — a map on the resource, set by the module | **Yes** | Verified |
 | 2 | `FACETS_ACTION_CRED_*` in the provider's environment | No | **Prerequisite, see below** |
 
-Either way the provider writes the values to one Kubernetes Secret per environment, named `facets-action-creds-<hash>`, and attaches it to every step with `envFrom`. Only the name reaches Terraform state.
+Either way the provider writes the values to a Kubernetes Secret owned by this action alone, named `facets-action-creds-<task_name>`, and attaches it to every step with `envFrom`. Only the name reaches Terraform state.
+
+The Secret is per action rather than per environment, so two modules in one environment can hold different credentials without overwriting each other, and the Secret is deleted with the action that owns it.
 
 Credentials are meant to be supplied by the **module**, not by whoever configures the resource. A module derives them from its own `cloud_account` input, so nothing credential-shaped appears in the blueprint spec or the UI form.
 
@@ -73,6 +75,8 @@ Credentials are scoped to an environment, so every action in one environment sha
 Under source 2 the credential appears in no attribute, so nothing changes when it rotates and Terraform would never call `Update`. The resource therefore reconciles the Secret during `Read` as well.
 
 The reconcile compares before writing, so a plan against unchanged credentials performs no write and needs no update permission. When the values differ, the next plan or apply converges them.
+
+The comparison is exact: a key stored in the Secret that the module no longer supplies counts as a mismatch and is removed. Otherwise a credential that had been revoked upstream would keep being injected through `envFrom` indefinitely.
 
 ## Example
 

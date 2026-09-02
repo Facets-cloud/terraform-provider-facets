@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Other details:
   - `cloud_action` is now an explicit argument rather than being implied by the resource type, so an action that mutates cloud infrastructure can be gated on `RUN_CLOUD_ACTION` regardless of which cloud it targets.
   - Credential names must be valid C identifiers. Kubernetes injects Secret keys verbatim as variable names and silently skips the rest, reporting it only as a pod event; the provider rejects them at apply time instead.
-  - The credentials Secret is scoped to an environment and shared by its actions, so rotation touches one object. Reconciliation compares before writing, so a plan against unchanged credentials performs no write.
+  - The credentials Secret is owned by a single action, named `facets-action-creds-<task_name>`, and is deleted with it. Per-environment scoping would let two modules supplying different service principals overwrite each other's keys with no error, and left the Secret with no owner to reclaim it.
+  - Reconciliation compares exactly before writing, so a plan against unchanged credentials performs no write, and a key a module stops supplying is removed rather than left injecting a revoked credential.
   - Rotation converges through `Read`: credentials appear in no attribute, so nothing would otherwise prompt Terraform to call `Update`.
   - `name` is not reconstructed on import from the `display_name` label, which is sanitized and cannot round-trip a name containing rejected characters.
 

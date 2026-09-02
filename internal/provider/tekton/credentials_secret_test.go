@@ -94,32 +94,103 @@ func TestReconcileCredentialsSecret_RotationOverwrites(t *testing.T) {
 	}
 }
 
-// Replacing the whole object destroyed unrelated keys and labels in an earlier
-// design. Reconcile owns only the keys it was given.
-func TestReconcileCredentialsSecret_PreservesUnmanagedKeysAndLabels(t *testing.T) {
+// The Secret belongs to one action, so a key it no longer supplies must be
+// REMOVED. Leaving it behind kept injecting a revoked credential through envFrom
+// forever -- the merge semantics this replaced could never clear one.
+func TestReconcileCredentialsSecret_RemovesKeysNoLongerSupplied(t *testing.T) {
 	c := testfake.NewClient(testfake.Secret("tekton-pipelines", "creds",
-		map[string]string{"KEEP_ME": "precious", "AWS_ACCESS_KEY_ID": "old"},
+		map[string]string{"REVOKED_KEY": "old-static-key", "AWS_ACCESS_KEY_ID": "old"},
 		map[string]string{"owner": "platform"}))
 	ops := NewResourceOperations(c)
 
-	if _, err := ops.ReconcileCredentialsSecret(context.Background(), "tekton-pipelines", "creds",
-		map[string]string{"AWS_ACCESS_KEY_ID": "new"}); err != nil {
+	changed, err := ops.ReconcileCredentialsSecret(context.Background(), "tekton-pipelines", "creds",
+		map[string]string{"AWS_ACCESS_KEY_ID": "new"})
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changed {
+		t.Error("dropping a key should report changed=true")
 	}
 
 	obj, data := fetch(t, c, "tekton-pipelines", "creds")
-	if data["KEEP_ME"] != "precious" {
-		t.Errorf("unmanaged key was destroyed: %v", data)
+	if _, still := data["REVOKED_KEY"]; still {
+		t.Errorf("key no longer supplied was left in place: %v", data)
 	}
-	if data["AWS_ACCESS_KEY_ID"] != "new" {
-		t.Errorf("managed key not updated: %v", data)
+	if data["AWS_ACCESS_KEY_ID"] != "new" || len(data) != 1 {
+		t.Errorf("data should be exactly the supplied set, got %v", data)
 	}
+
+	// Labels set by others are still none of our business.
 	labels, _, _ := unstructured.NestedStringMap(obj.Object, "metadata", "labels")
 	if labels["owner"] != "platform" {
 		t.Errorf("unmanaged label was destroyed: %v", labels)
 	}
 	if labels[managedByLabel] != managedByValue {
 		t.Errorf("provider label not added: %v", labels)
+	}
+}
+
+// An extra key in the cluster is a mismatch, so Read must not report "unchanged"
+// and leave a stale credential in place.
+func TestReconcileCredentialsSecret_ExtraKeyCountsAsMismatch(t *testing.T) {
+	c := testfake.NewClient(testfake.Secret("tekton-pipelines", "creds",
+		map[string]string{"WANTED": "v", "STALE": "v"}, nil))
+	ops := NewResourceOperations(c)
+
+	changed, err := ops.ReconcileCredentialsSecret(context.Background(), "tekton-pipelines", "creds",
+		map[string]string{"WANTED": "v"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatal("an extra stored key must count as a mismatch")
+	}
+	if _, data := fetch(t, c, "tekton-pipelines", "creds"); len(data) != 1 {
+		t.Errorf("expected exactly the supplied set, got %v", data)
+	}
+}
+
+// A Secret appearing between the Get and the Create is this action's own -- a
+// retry after a partial apply. Treating AlreadyExists as success skipped the
+// write entirely, so the losing writer's keys never landed.
+func TestReconcileCredentialsSecret_AlreadyExistsStillReconciles(t *testing.T) {
+	c := testfake.NewClient()
+	ops := NewResourceOperations(c)
+
+	// Seed after constructing the client so the Get misses and the Create collides.
+	if _, err := c.Resource(testfake.SecretGVR).Namespace("tekton-pipelines").
+		Create(context.Background(),
+			testfake.Secret("tekton-pipelines", "creds", map[string]string{"K": "stale"}, nil),
+			metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	if _, err := ops.ReconcileCredentialsSecret(context.Background(), "tekton-pipelines", "creds",
+		map[string]string{"K": "fresh"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, data := fetch(t, c, "tekton-pipelines", "creds"); data["K"] != "fresh" {
+		t.Errorf("AlreadyExists path skipped the write: %v", data)
+	}
+}
+
+// Nothing deleted the Secret while it was environment-scoped, so a live
+// credential outlived every teardown.
+func TestDeleteCredentialsSecret_RemovesAndIsIdempotent(t *testing.T) {
+	c := testfake.NewClient(testfake.Secret("tekton-pipelines", "creds",
+		map[string]string{"K": "v"}, nil))
+	ops := NewResourceOperations(c)
+
+	if err := ops.DeleteCredentialsSecret(context.Background(), "tekton-pipelines", "creds"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := c.Resource(testfake.SecretGVR).Namespace("tekton-pipelines").
+		Get(context.Background(), "creds", metav1.GetOptions{}); err == nil {
+		t.Error("Secret still present after delete")
+	}
+	// Destroy retries must not fail on a Secret that is already gone.
+	if err := ops.DeleteCredentialsSecret(context.Background(), "tekton-pipelines", "creds"); err != nil {
+		t.Errorf("delete should be idempotent on NotFound, got %v", err)
 	}
 }
 

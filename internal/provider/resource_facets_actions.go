@@ -2,8 +2,6 @@ package provider
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -317,15 +315,19 @@ func (r *FacetsActionsResource) creds(ctx context.Context, m *FacetsActionsResou
 	return credentials.FromEnv()
 }
 
-// credentialsSecretName derives the Secret name from the environment.
+// credentialsSecretName derives the Secret name from the action's Task.
 //
-// Credentials belong to an environment, not to an individual action, so every
-// action in an environment shares one Secret: one object to rotate rather than
-// one per action. The name is a hash so it cannot collide with anything else in
-// a namespace shared by every project on a control plane.
-func credentialsSecretName(envUniqueName string) string {
-	sum := sha256.Sum256([]byte(envUniqueName))
-	return fmt.Sprintf("%s-%s", credentialsSecretPrefix, hex.EncodeToString(sum[:])[:16])
+// One Secret per action, not per environment. Credentials are supplied per
+// resource -- a module derives them from its own cloud_account input -- so two
+// modules in one environment can legitimately hold different sets. Sharing one
+// object made them overwrite each other's keys with no error, and left the
+// Secret with no owner to delete it.
+//
+// taskName is already a hash of resource name, environment and action name, so
+// the result is unique within the namespace that every project on a control
+// plane shares.
+func credentialsSecretName(taskName string) string {
+	return fmt.Sprintf("%s-%s", credentialsSecretPrefix, taskName)
 }
 
 func (r *FacetsActionsResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -447,12 +449,22 @@ func (r *FacetsActionsResource) Delete(ctx context.Context, req resource.DeleteR
 		return
 	}
 
-	// Only the Task is removed. The credentials Secret is shared by every action
-	// in the environment, so deleting it here would break the ones that remain;
-	// it is reclaimed with the environment, not with an individual action.
-	if err := ops.DeleteResource(ctx, namespaceOrDefault(state.Namespace), state.TaskName.ValueString(),
-		actionTaskGVR.Group, actionTaskGVR.Version, actionTaskGVR.Resource); err != nil {
-		resp.Diagnostics.AddError("Error deleting Task", err.Error())
+	ns := namespaceOrDefault(state.Namespace)
+
+	// Both objects belong to this action alone, so both go. Attempted
+	// best-effort: a failure on one must not leave the other behind, and both
+	// deletes are idempotent on NotFound so retries are safe.
+	taskErr := ops.DeleteResource(ctx, ns, state.TaskName.ValueString(),
+		actionTaskGVR.Group, actionTaskGVR.Version, actionTaskGVR.Resource)
+	secretErr := ops.DeleteCredentialsSecret(ctx, ns, state.CredentialsSecret.ValueString())
+
+	if taskErr != nil {
+		resp.Diagnostics.AddError("Error deleting Task", taskErr.Error())
+	}
+	if secretErr != nil {
+		// Surfaced rather than swallowed: a credential left in the cluster after
+		// teardown is exactly what this delete exists to prevent.
+		resp.Diagnostics.AddError("Error deleting credentials Secret", secretErr.Error())
 	}
 }
 
@@ -487,7 +499,6 @@ func (r *FacetsActionsResource) ImportState(ctx context.Context, req resource.Im
 	}
 
 	labels, _, _ := unstructured.NestedStringMap(task.Object, "metadata", "labels")
-	envUnique := labels["environment_unique_name"]
 
 	state := FacetsActionsResourceModel{
 		ID:                 types.StringValue(namespace + "/" + taskName),
@@ -495,7 +506,7 @@ func (r *FacetsActionsResource) ImportState(ctx context.Context, req resource.Im
 		TaskName:           types.StringValue(taskName),
 		FacetsResourceName: types.StringValue(labels["resource_name"]),
 		CloudAction:        types.BoolValue(labels["cloud_action"] == "true"),
-		CredentialsSecret:  types.StringValue(credentialsSecretName(envUnique)),
+		CredentialsSecret:  types.StringValue(credentialsSecretName(taskName)),
 	}
 
 	resp.Diagnostics.AddWarning("Partial import",
@@ -573,7 +584,7 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 	plan.Namespace = types.StringValue(namespace)
 	plan.TaskName = types.StringValue(names.TaskName)
 	plan.ID = types.StringValue(namespace + "/" + names.TaskName)
-	plan.CredentialsSecret = types.StringValue(credentialsSecretName(env.UniqueName.ValueString()))
+	plan.CredentialsSecret = types.StringValue(credentialsSecretName(names.TaskName))
 
 	customLabels := map[string]string{}
 	if !plan.Labels.IsNull() {
