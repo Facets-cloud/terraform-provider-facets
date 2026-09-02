@@ -394,10 +394,24 @@ func (r *FacetsActionsResource) Read(ctx context.Context, req resource.ReadReque
 		return
 	}
 
+	// Recompute the derived Secret name. It is Computed, so nothing else would
+	// notice that the derivation changed -- it used to hash the environment,
+	// giving every action in an environment one shared object. An action deployed
+	// under that scheme would otherwise keep the shared Secret indefinitely,
+	// since Terraform sees no drift and never calls Update. Correcting it here
+	// surfaces a diff, and the next apply re-renders the Task against its own
+	// Secret.
+	if expected := credentialsSecretName(state.TaskName.ValueString()); state.CredentialsSecret.ValueString() != expected {
+		state.CredentialsSecret = types.StringValue(expected)
+	}
+
 	// Credentials live outside Terraform, so no attribute changes when they
 	// rotate and Terraform would otherwise never call Update. Reconciling here is
 	// what makes rotation converge. The reconcile compares before writing, so a
 	// plan against unchanged credentials performs no write.
+	//
+	// Runs after the name correction above so the Secret exists under its new
+	// name before any Task is pointed at it.
 	resp.Diagnostics.Append(r.reconcileCredentials(ctx, ops, &state, true)...)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)

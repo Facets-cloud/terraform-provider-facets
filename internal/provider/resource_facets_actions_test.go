@@ -28,3 +28,23 @@ func TestCredentialsSecretName_IsPerActionNotPerEnvironment(t *testing.T) {
 		t.Error("must be deterministic: Read derives it again on every plan")
 	}
 }
+
+// An action deployed while the Secret name hashed the ENVIRONMENT must migrate
+// to its own Secret. The attribute is Computed, so if Read does not recompute it
+// Terraform sees no drift, never calls Update, and the Task keeps pointing at
+// the shared object -- leaving the very bug this scoping change fixes in place
+// for everything already deployed.
+func TestCredentialsSecretName_LegacyEnvScopedNameIsNotStable(t *testing.T) {
+	taskName := "dd103033758be2b94799db4a3e2ffde5"
+
+	// What the old derivation produced for environment "fourkites-actions-dev".
+	legacy := "facets-action-creds-7811c0a8daaf96f2"
+	current := credentialsSecretName(taskName)
+
+	if legacy == current {
+		t.Fatal("legacy and current names match; the migration case cannot be detected")
+	}
+	if current == credentialsSecretName("a-different-task") {
+		t.Error("name must vary with the task, or two actions still share a Secret")
+	}
+}
