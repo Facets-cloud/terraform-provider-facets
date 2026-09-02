@@ -30,6 +30,7 @@ var (
 	_ resource.Resource                = &FacetsActionsResource{}
 	_ resource.ResourceWithConfigure   = &FacetsActionsResource{}
 	_ resource.ResourceWithImportState = &FacetsActionsResource{}
+	_ resource.ResourceWithModifyPlan  = &FacetsActionsResource{}
 )
 
 var actionTaskGVR = k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
@@ -330,6 +331,45 @@ func credentialsSecretName(taskName string) string {
 	return fmt.Sprintf("%s-%s", credentialsSecretPrefix, taskName)
 }
 
+// ModifyPlan forces an update when the derived Secret name in state no longer
+// matches what the current derivation produces.
+//
+// credentials_secret is Computed, and a Computed value drifting cannot by itself
+// produce a diff: Terraform compares configuration against state, so a
+// provider-controlled value that changes during refresh is simply recorded.
+// Correcting it in Read is therefore worse than doing nothing -- it repairs
+// state while leaving the Task still referencing the old Secret, and removes the
+// only signal that anything needs re-rendering.
+//
+// The name used to hash facets_environment.unique_name, so every action in an
+// environment shared one object. Actions deployed under that scheme have to be
+// re-rendered against their own Secret, and this is what puts them in the plan.
+func (r *FacetsActionsResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	// Nothing to migrate on create (no prior state) or destroy (no plan).
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var state, plan FacetsActionsResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if state.TaskName.IsNull() || state.TaskName.ValueString() == "" {
+		return
+	}
+
+	expected := credentialsSecretName(state.TaskName.ValueString())
+	if state.CredentialsSecret.ValueString() == expected {
+		return
+	}
+
+	plan.CredentialsSecret = types.StringValue(expected)
+	resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+}
+
 func (r *FacetsActionsResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan FacetsActionsResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -394,24 +434,10 @@ func (r *FacetsActionsResource) Read(ctx context.Context, req resource.ReadReque
 		return
 	}
 
-	// Recompute the derived Secret name. It is Computed, so nothing else would
-	// notice that the derivation changed -- it used to hash the environment,
-	// giving every action in an environment one shared object. An action deployed
-	// under that scheme would otherwise keep the shared Secret indefinitely,
-	// since Terraform sees no drift and never calls Update. Correcting it here
-	// surfaces a diff, and the next apply re-renders the Task against its own
-	// Secret.
-	if expected := credentialsSecretName(state.TaskName.ValueString()); state.CredentialsSecret.ValueString() != expected {
-		state.CredentialsSecret = types.StringValue(expected)
-	}
-
 	// Credentials live outside Terraform, so no attribute changes when they
 	// rotate and Terraform would otherwise never call Update. Reconciling here is
 	// what makes rotation converge. The reconcile compares before writing, so a
 	// plan against unchanged credentials performs no write.
-	//
-	// Runs after the name correction above so the Secret exists under its new
-	// name before any Task is pointed at it.
 	resp.Diagnostics.Append(r.reconcileCredentials(ctx, ops, &state, true)...)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
