@@ -1,10 +1,15 @@
 package tekton
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // ResourceMetadata contains the metadata for a Tekton resource
@@ -42,17 +47,28 @@ func NewResourceMetadata(displayName, resourceName, resourceKind, envUniqueName 
 func (m *ResourceMetadata) Labels() map[string]string {
 	labels := make(map[string]string)
 
-	// First, add custom labels (if any)
+	// First, add custom labels (if any). Keys as well as values are sanitized:
+	// a label key is a qualified name and a label value has its own charset, and
+	// either one being invalid fails the whole apply, not just that label.
 	for k, v := range m.CustomLabels {
-		labels[k] = v
+		key := SanitizeLabelKey(k)
+		if key == "" {
+			continue
+		}
+		labels[key] = SanitizeLabelValue(v)
 	}
 
-	// Then, add auto-generated labels (these take precedence)
-	labels["display_name"] = m.DisplayName
-	labels["resource_name"] = m.ResourceName
-	labels["resource_kind"] = m.ResourceKind
-	labels["environment_unique_name"] = m.EnvUniqueName
-	labels["cluster_id"] = m.ClusterID
+	// Then, add auto-generated labels (these take precedence).
+	//
+	// Every value is sanitized, not just display_name. These are human-authored
+	// strings from a blueprint -- an action called "Stop Database", a resource
+	// named with a space, a 100-character resource name -- and Kubernetes rejects
+	// all of them, failing the entire apply with `metadata.labels: Invalid value`.
+	labels["display_name"] = SanitizeLabelValue(m.DisplayName)
+	labels["resource_name"] = SanitizeLabelValue(m.ResourceName)
+	labels["resource_kind"] = SanitizeLabelValue(m.ResourceKind)
+	labels["environment_unique_name"] = SanitizeLabelValue(m.EnvUniqueName)
+	labels["cluster_id"] = SanitizeLabelValue(m.ClusterID)
 	labels["cloud_action"] = formatBool(m.IsCloudAction)
 
 	return labels
@@ -96,4 +112,75 @@ func ExtractMetadata(obj *unstructured.Unstructured) (string, string, error) {
 	}
 
 	return namespace, name, nil
+}
+
+var (
+	labelValueInvalid = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+	labelKeyInvalid   = regexp.MustCompile(`[^A-Za-z0-9._/-]`)
+)
+
+// SanitizeLabelValue coerces a string into a valid Kubernetes label value: at
+// most 63 characters of [A-Za-z0-9._-], beginning and ending alphanumeric.
+//
+// The transformation is lossy, so the exact original is NOT recoverable from the
+// label -- callers that need the original must keep it elsewhere. It is also not
+// injective: a value made entirely of rejected characters collapses to a hash
+// rather than to the empty string, because two differently-named actions both
+// labelled "" would be indistinguishable to anything selecting on the label.
+func SanitizeLabelValue(v string) string {
+	if v == "" {
+		return ""
+	}
+
+	// Leave anything Kubernetes already accepts exactly as it is. Without this
+	// guard the transformations below rewrite legal values -- "restart--db"
+	// collapses to "restart-db" -- which changes the label on actions that work
+	// today, forcing an in-place update and breaking lookups that match on
+	// display_name.
+	if len(validation.IsValidLabelValue(v)) == 0 {
+		return v
+	}
+
+	out := labelValueInvalid.ReplaceAllString(v, "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-._")
+
+	if out == "" {
+		// Everything was stripped (a name in a non-Latin script, or pure
+		// punctuation). Fall back to a stable digest so distinct inputs stay
+		// distinguishable.
+		return "x-" + shortHash(v)
+	}
+
+	if len(out) > 63 {
+		// Truncation alone would collapse two long values sharing a prefix, so
+		// keep a digest of the original in the surviving suffix.
+		out = strings.Trim(out[:54], "-._") + "-" + shortHash(v)
+	}
+	return out
+}
+
+// SanitizeLabelKey coerces a string into a valid label key. Returns "" when
+// nothing usable remains, which the caller treats as "drop this label".
+func SanitizeLabelKey(k string) string {
+	if len(validation.IsQualifiedName(k)) == 0 {
+		return k
+	}
+
+	out := labelKeyInvalid.ReplaceAllString(k, "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-._/")
+	if len(out) > 63 {
+		out = strings.Trim(out[:63], "-._/")
+	}
+	return out
+}
+
+func shortHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:8]
 }

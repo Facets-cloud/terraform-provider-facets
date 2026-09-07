@@ -101,6 +101,7 @@ func (p *FacetsProvider) Resources(ctx context.Context) []func() resource.Resour
 	return []func() resource.Resource{
 		NewTektonActionKubernetesResource,
 		NewTektonActionAWSResource,
+		NewFacetsActionsResource,
 	}
 }
 

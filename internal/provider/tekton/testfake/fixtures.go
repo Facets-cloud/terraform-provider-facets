@@ -1,6 +1,7 @@
 package testfake
 
 import (
+	"encoding/base64"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -44,4 +45,33 @@ func buildTektonObject(kind, namespace, name string, labels map[string]string) *
 	}
 
 	return obj
+}
+
+// Secret builds a core/v1 Secret carrying base64-encoded data, matching what a
+// real API server returns. The distinction matters: a fixture that stores
+// `stringData` verbatim cannot detect a reconcile that drops existing keys,
+// because the merge path reads `data`.
+func Secret(namespace, name string, data map[string]string, labels map[string]string) *unstructured.Unstructured {
+	encoded := map[string]interface{}{}
+	for k, v := range data {
+		encoded[k] = base64.StdEncoding.EncodeToString([]byte(v))
+	}
+	meta := map[string]interface{}{
+		"name":      name,
+		"namespace": namespace,
+	}
+	if labels != nil {
+		l := map[string]interface{}{}
+		for k, v := range labels {
+			l[k] = v
+		}
+		meta["labels"] = l
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   meta,
+		"type":       "Opaque",
+		"data":       encoded,
+	}}
 }
