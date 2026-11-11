@@ -52,7 +52,10 @@ func (m *ResourceMetadata) Labels() map[string]string {
 	// either one being invalid fails the whole apply, not just that label.
 	for k, v := range m.CustomLabels {
 		key := SanitizeLabelKey(k)
-		if key == "" {
+		// The action-key label is generated-only, even when no action_key is
+		// set: the control plane identifies the action by it, so a custom label
+		// must not be able to claim an action.
+		if key == "" || key == ActionKeyLabel {
 			continue
 		}
 		labels[key] = SanitizeLabelValue(v)

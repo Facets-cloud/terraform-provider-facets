@@ -27,10 +27,11 @@ import (
 )
 
 var (
-	_ resource.Resource                = &FacetsActionsResource{}
-	_ resource.ResourceWithConfigure   = &FacetsActionsResource{}
-	_ resource.ResourceWithImportState = &FacetsActionsResource{}
-	_ resource.ResourceWithModifyPlan  = &FacetsActionsResource{}
+	_ resource.Resource                   = &FacetsActionsResource{}
+	_ resource.ResourceWithConfigure      = &FacetsActionsResource{}
+	_ resource.ResourceWithImportState    = &FacetsActionsResource{}
+	_ resource.ResourceWithModifyPlan     = &FacetsActionsResource{}
+	_ resource.ResourceWithValidateConfig = &FacetsActionsResource{}
 )
 
 var actionTaskGVR = k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
@@ -87,6 +88,8 @@ type FacetsActionsResourceModel struct {
 	TaskName           types.String `tfsdk:"task_name"`
 	Credentials        types.Map    `tfsdk:"credentials"`
 	CredentialsSecret  types.String `tfsdk:"credentials_secret"`
+	ActionKey          types.String `tfsdk:"action_key"`
+	Result             types.Bool   `tfsdk:"result"`
 }
 
 func (r *FacetsActionsResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -273,8 +276,48 @@ func (r *FacetsActionsResource) Schema(ctx context.Context, req resource.SchemaR
 					"attaches to every step. The name only -- never the credential values.",
 				Computed: true,
 			},
+			"action_key": actionKeyAttribute(),
+			"result":     resultAttribute(),
 		},
 	}
+}
+
+// ValidateConfig checks the action-result attributes together: `result`
+// requires `action_key`, and with a result enabled no step may set the
+// reserved FACETS_RESULT_FILE itself.
+func (r *FacetsActionsResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config FacetsActionsResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(validateActionContract(config.ActionKey, config.Result)...)
+	if !config.Result.ValueBool() || config.Steps.IsNull() || config.Steps.IsUnknown() {
+		return
+	}
+
+	var steps []tekton.ActionStepModel
+	resp.Diagnostics.Append(config.Steps.ElementsAs(ctx, &steps, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for _, step := range steps {
+		resp.Diagnostics.Append(reservedEnvDiags(step.Name.ValueString(), actionStepEnvNames(step))...)
+	}
+}
+
+// actionStepEnvNames returns the names a step's env map sets, or none while the
+// map is null or unknown.
+func actionStepEnvNames(step tekton.ActionStepModel) []string {
+	if step.Env.IsNull() || step.Env.IsUnknown() {
+		return nil
+	}
+	names := make([]string, 0, len(step.Env.Elements()))
+	for name := range step.Env.Elements() {
+		names = append(names, name)
+	}
+	return names
 }
 
 func (r *FacetsActionsResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -420,8 +463,9 @@ func (r *FacetsActionsResource) Read(ctx context.Context, req resource.ReadReque
 
 	ns := namespaceOrDefault(state.Namespace)
 
-	if _, err := client.Resource(actionTaskGVR).Namespace(ns).
-		Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{}); err != nil {
+	task, err := client.Resource(actionTaskGVR).Namespace(ns).
+		Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	if err != nil {
 		// Only a genuine NotFound means it is gone. A transient failure -- 503,
 		// Forbidden, timeout -- must retain state, or the next apply tries to
 		// recreate an object that is still there.
@@ -433,6 +477,10 @@ func (r *FacetsActionsResource) Read(ctx context.Context, req resource.ReadReque
 			fmt.Sprintf("Could not read Task %s/%s: %s", ns, state.TaskName.ValueString(), err))
 		return
 	}
+
+	// Refresh the action-result contract from the Task so an out-of-band edit
+	// to the label or results shows as drift.
+	syncActionContract(task, &state.ActionKey, &state.Result)
 
 	// Credentials live outside Terraform, so no attribute changes when they
 	// rotate and Terraform would otherwise never call Update. Reconciling here is
@@ -548,9 +596,10 @@ func (r *FacetsActionsResource) ImportState(ctx context.Context, req resource.Im
 		CloudAction:        types.BoolValue(labels["cloud_action"] == "true"),
 		CredentialsSecret:  types.StringValue(credentialsSecretName(taskName)),
 	}
+	syncActionContract(task, &state.ActionKey, &state.Result)
 
 	resp.Diagnostics.AddWarning("Partial import",
-		"Imported namespace, task_name, facets_resource_name and cloud_action. You must supply name, "+
+		"Imported namespace, task_name, facets_resource_name, cloud_action, action_key and result. You must supply name, "+
 			"facets_environment, facets_resource, steps and params in configuration: the Task does not "+
 			"retain them losslessly.")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -665,13 +714,24 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 		secretForSteps = plan.CredentialsSecret.ValueString()
 	}
 
+	// FACETS_RESULT_FILE goes after the step's own sorted env, so the order
+	// stays deterministic. Every step here is a user step -- this resource
+	// renders no StepAction ref, which Tekton would reject env on.
+	contract := actionContract(plan.ActionKey, plan.Result)
 	tektonSteps := make([]interface{}, 0, len(steps))
 	for _, s := range steps {
+		if contract.Result {
+			diags.Append(reservedEnvDiags(s.Name.ValueString(), actionStepEnvNames(s))...)
+			if diags.HasError() {
+				return nil, diags
+			}
+		}
 		built, err := tekton.BuildActionStep(ctx, s, secretForSteps)
 		if err != nil {
 			diags.AddError("Invalid step", err.Error())
 			return nil, diags
 		}
+		contract.ApplyStepEnv(built)
 		tektonSteps = append(tektonSteps, built)
 	}
 
@@ -695,10 +755,15 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 		description = plan.Description.ValueString()
 	}
 
+	labels := metadata.LabelsAsInterface()
+	contract.ApplyLabels(labels)
+
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    names.TaskName,
 		Namespace:   namespace,
 		Description: description,
-		Labels:      metadata.LabelsAsInterface(),
+		Labels:      labels,
+		Annotations: contract.Annotations(),
+		Results:     contract.Results(),
 	}, tektonSteps, taskParams), diags
 }

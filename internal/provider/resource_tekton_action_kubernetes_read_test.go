@@ -35,8 +35,8 @@ const (
 // stateForRead returns a minimal TektonActionKubernetesResourceModel populated
 // with just the namespace and task name fields that readResourceState reads.
 // Other fields are left zero-valued — they aren't relevant to Read.
-func stateForRead(namespace, taskName string) TektonActionKubernetesResourceModel {
-	return TektonActionKubernetesResourceModel{
+func stateForRead(namespace, taskName string) *TektonActionKubernetesResourceModel {
+	return &TektonActionKubernetesResourceModel{
 		Namespace: types.StringValue(namespace),
 		TaskName:  types.StringValue(taskName),
 	}

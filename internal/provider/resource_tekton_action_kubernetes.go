@@ -24,9 +24,10 @@ import (
 )
 
 var (
-	_ resource.Resource                = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithConfigure   = &TektonActionKubernetesResource{}
-	_ resource.ResourceWithImportState = &TektonActionKubernetesResource{}
+	_ resource.Resource                   = &TektonActionKubernetesResource{}
+	_ resource.ResourceWithConfigure      = &TektonActionKubernetesResource{}
+	_ resource.ResourceWithImportState    = &TektonActionKubernetesResource{}
+	_ resource.ResourceWithValidateConfig = &TektonActionKubernetesResource{}
 )
 
 func NewTektonActionKubernetesResource() resource.Resource {
@@ -58,6 +59,8 @@ type TektonActionKubernetesResourceModel struct {
 	Params             types.List   `tfsdk:"params"`
 	TaskName           types.String `tfsdk:"task_name"`
 	StepActionName     types.String `tfsdk:"step_action_name"`
+	ActionKey          types.String `tfsdk:"action_key"`
+	Result             types.Bool   `tfsdk:"result"`
 }
 
 func (r *TektonActionKubernetesResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -242,7 +245,43 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					"This StepAction automatically configures Kubernetes access for the workflow steps.",
 				Computed: true,
 			},
+			"action_key": actionKeyAttribute(),
+			"result":     resultAttribute(),
 		},
+	}
+}
+
+// ValidateConfig checks the action-result attributes together: `result`
+// requires `action_key`, and with a result enabled no step may set the
+// reserved FACETS_RESULT_FILE itself.
+func (r *TektonActionKubernetesResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config TektonActionKubernetesResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(validateActionContract(config.ActionKey, config.Result)...)
+	if !config.Result.ValueBool() || config.Steps.IsNull() || config.Steps.IsUnknown() {
+		return
+	}
+
+	var steps []tekton.StepModel
+	resp.Diagnostics.Append(config.Steps.ElementsAs(ctx, &steps, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for _, step := range steps {
+		if step.Env.IsNull() || step.Env.IsUnknown() {
+			continue
+		}
+		var env []tekton.EnvVarModel
+		resp.Diagnostics.Append(step.Env.ElementsAs(ctx, &env, false)...)
+		names := make([]string, 0, len(env))
+		for _, e := range env {
+			names = append(names, e.Name.ValueString())
+		}
+		resp.Diagnostics.Append(reservedEnvDiags(step.Name.ValueString(), names)...)
 	}
 }
 
@@ -421,7 +460,7 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 		return
 	}
 
-	remove, diags := r.readResourceState(ctx, client, state)
+	remove, diags := r.readResourceState(ctx, client, &state)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -446,12 +485,15 @@ func (r *TektonActionKubernetesResource) Read(ctx context.Context, req resource.
 // RBAC, timeout, context cancellation) surface as diagnostics and retain
 // state. Both Task and StepAction are checked; asymmetric in-cluster drift
 // (one present, one missing) surfaces a warning and retains state.
-func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, client dynamic.Interface, state TektonActionKubernetesResourceModel) (removeFromState bool, diags diag.Diagnostics) {
+//
+// When the Task exists, action_key and result are refreshed from it in place so
+// drift in the action-result contract shows up in the plan.
+func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, client dynamic.Interface, state *TektonActionKubernetesResourceModel) (removeFromState bool, diags diag.Diagnostics) {
 	taskGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "tasks"}
 	stepActionGVR := k8sschema.GroupVersionResource{Group: "tekton.dev", Version: "v1beta1", Resource: "stepactions"}
 
 	taskExists := true
-	_, err := client.Resource(taskGVR).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
+	task, err := client.Resource(taskGVR).Namespace(state.Namespace.ValueString()).Get(ctx, state.TaskName.ValueString(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			taskExists = false
@@ -497,6 +539,7 @@ func (r *TektonActionKubernetesResource) readResourceState(ctx context.Context, 
 		return false, diags
 	default:
 		// Both present and healthy.
+		syncActionContract(task, &state.ActionKey, &state.Result)
 		return false, diags
 	}
 }
@@ -736,6 +779,7 @@ func (r *TektonActionKubernetesResource) ImportState(ctx context.Context, req re
 		TaskName:           types.StringValue(taskName),
 		StepActionName:     types.StringValue(stepActionName),
 	}
+	syncActionContract(task, &state.ActionKey, &state.Result)
 
 	// Note: We cannot fully reconstruct facets_environment, facets_resource, steps, params from the Task
 	// User will need to manually specify these in their configuration
@@ -768,9 +812,13 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		},
 	}
 
+	// The setup-credentials step above is a StepAction ref, which Tekton
+	// forbids env on, so only user steps receive the result file.
+	contract := actionContract(plan.ActionKey, plan.Result)
 	for _, step := range steps {
 		tektonStep := tekton.BuildStepWithResources(ctx, step)
 		tekton.AddEnvVar(tektonStep, "KUBECONFIG", "/workspace/.kube/config")
+		contract.ApplyStepEnv(tektonStep)
 		tektonSteps = append(tektonSteps, tektonStep)
 	}
 
@@ -798,10 +846,20 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 		}
 	}
 
+	// Copy before adding the action key: the caller builds the StepAction from
+	// the same metadata, and the label identifies the Task alone.
+	taskLabels := make(map[string]interface{}, len(labels)+1)
+	for k, v := range labels {
+		taskLabels[k] = v
+	}
+	contract.ApplyLabels(taskLabels)
+
 	return tekton.BuildTask(tekton.TaskSpec{
 		TaskName:    plan.TaskName.ValueString(),
 		Namespace:   plan.Namespace.ValueString(),
 		Description: plan.Description.ValueString(),
-		Labels:      labels,
+		Labels:      taskLabels,
+		Annotations: contract.Annotations(),
+		Results:     contract.Results(),
 	}, tektonSteps, taskParams)
 }
