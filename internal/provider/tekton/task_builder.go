@@ -13,6 +13,10 @@ type TaskSpec struct {
 	Namespace   string
 	Description string
 	Labels      map[string]interface{}
+	// Annotations, when non-empty, are emitted as metadata.annotations.
+	Annotations map[string]interface{}
+	// Results, when non-empty, are emitted as spec.results.
+	Results []interface{}
 }
 
 // BuildStepWithResources builds a Tekton step with environment variables and compute resources
@@ -92,20 +96,32 @@ func BuildTask(spec TaskSpec, steps []interface{}, params []interface{}) *unstru
 		description = spec.Description
 	}
 
+	metadata := map[string]interface{}{
+		"name":      spec.TaskName,
+		"namespace": spec.Namespace,
+		"labels":    spec.Labels,
+	}
+	taskSpec := map[string]interface{}{
+		"description": description,
+		"steps":       steps,
+		"params":      params,
+	}
+
+	// Both keys are omitted entirely when empty, so a Task without a result
+	// renders exactly as it did before results existed.
+	if len(spec.Annotations) > 0 {
+		metadata["annotations"] = spec.Annotations
+	}
+	if len(spec.Results) > 0 {
+		taskSpec["results"] = spec.Results
+	}
+
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "tekton.dev/v1beta1",
 			"kind":       "Task",
-			"metadata": map[string]interface{}{
-				"name":      spec.TaskName,
-				"namespace": spec.Namespace,
-				"labels":    spec.Labels,
-			},
-			"spec": map[string]interface{}{
-				"description": description,
-				"steps":       steps,
-				"params":      params,
-			},
+			"metadata":   metadata,
+			"spec":       taskSpec,
 		},
 	}
 }

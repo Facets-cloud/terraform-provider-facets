@@ -120,6 +120,54 @@ resource "facets_actions" "stop_database" {
 
 The same resource with an AWS step differs only in the image and the script.
 
+## Returning a result
+
+An action can hand a JSON object back to Facets. Declare the action and its result schema in the module's `facets.yaml`, then set `action_key` to the same key and `result = true`:
+
+```hcl
+resource "facets_actions" "db_status" {
+  name                 = "Database Status"
+  action_key           = "db_status"
+  result               = true
+  facets_resource_name = var.instance_name
+  facets_environment   = { unique_name = var.environment_unique_name }
+  facets_resource      = { kind = "postgres" }
+
+  steps = [{
+    name  = "status"
+    image = "amazon/aws-cli:2.31.9"
+    env   = { DB_INSTANCE_ID = var.db_instance_id }
+
+    script = <<-EOT
+      #!/bin/bash
+      set -euo pipefail
+      STATE=$(aws rds describe-db-instances \
+        --db-instance-identifier "$DB_INSTANCE_ID" \
+        --query 'DBInstances[0].DBInstanceStatus' --output text)
+      jq -n --arg state "$STATE" --arg id "$DB_INSTANCE_ID" \
+        '{instance_id: $id, status: $state}' > "$FACETS_RESULT_FILE"
+    EOT
+  }]
+}
+```
+
+**What the provider renders** when `result = true`:
+
+- the label `facets.cloud/action-key: <action_key>`, which Tekton copies onto every TaskRun so the control plane can identify the action;
+- the annotation `facets.cloud/result-transport: tekton-results`;
+- a Task result `{ name: facets_result, type: string, description: "Facets action result (JSON object)" }`;
+- `FACETS_RESULT_FILE=$(results.facets_result.path)` in the env of every step you declare.
+
+**Constraints:**
+
+- The result must be **one JSON object** that matches the action's result schema in the module's `facets.yaml`. Arrays, strings and other scalars are rejected by the control plane.
+- Keep it under roughly **3.5 KB**. Tekton stores Task results in the container termination message, which is capped at 4 KB per pod and shared with Tekton's own bookkeeping; a larger result fails the step.
+- Write the file once, from the step that knows the answer. Steps that write nothing leave the result to whichever step did.
+- `FACETS_RESULT_FILE` is reserved while `result = true`: a step that sets it in `env` fails validation.
+- `result = true` requires `action_key`. `action_key` alone is allowed and only adds the label.
+
+Neither attribute changes anything when unset — no label, annotation, result or env is added, and existing actions show no plan diff.
+
 ## Why no StepAction
 
 The per-cloud resources prepend a StepAction that injects credentials. That approach cannot be made cloud-agnostic:
@@ -146,6 +194,8 @@ Together those mean a StepAction can only carry credentials whose names the prov
 - `namespace` — defaults to `tekton-pipelines`. Changing it forces replacement.
 - `labels` — extra labels, merged with the generated ones, which win on conflict. Keys and values are sanitized to what Kubernetes accepts; see [Label sanitization](#label-sanitization).
 - `params` — list of `{ name, type }`; type is `string`, `array` or `object`.
+- `action_key` — key of the action as declared in the module's `facets.yaml`. Written to the `facets.cloud/action-key` label. Must match `^[a-z][a-z0-9_]{0,62}$` and end with a letter or digit (it is a Kubernetes label value). Changing it updates the Task in place; the Task name does not change.
+- `result` — whether the action returns a JSON-object result; defaults to `false`. Requires `action_key`. See [Returning a result](#returning-a-result).
 
 ### Optional step arguments
 
@@ -177,7 +227,7 @@ terraform import facets_actions.example <task-name>
 terraform import facets_actions.example tekton-pipelines/<task-name>
 ```
 
-Import is partial. `name` is deliberately not reconstructed from the `display_name` label: that label is sanitized for Kubernetes and cannot round-trip a name containing a space or any other rejected character, and importing a silently wrong value is worse than leaving it to be supplied.
+Import is partial; `action_key` and `result` are read back from the Task. `name` is deliberately not reconstructed from the `display_name` label: that label is sanitized for Kubernetes and cannot round-trip a name containing a space or any other rejected character, and importing a silently wrong value is worse than leaving it to be supplied.
 
 ## Notes
 

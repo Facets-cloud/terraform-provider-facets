@@ -282,6 +282,59 @@ resource "facets_tekton_action_kubernetes" "ci_pipeline" {
 }
 ```
 
+## Returning a result
+
+An action can hand a JSON object back to Facets. Declare the action and its result schema in the module's `facets.yaml`, then set `action_key` to the same key and `result = true`:
+
+```hcl
+resource "facets_tekton_action_kubernetes" "rollout_status" {
+  name                 = "rollout-status"
+  action_key           = "rollout_status"
+  result               = true
+  facets_resource_name = "my-app"
+
+  facets_environment = {
+    unique_name = "production"
+  }
+
+  facets_resource = {
+    kind = "application"
+  }
+
+  steps = [
+    {
+      name  = "status"
+      image = "bitnami/kubectl:latest"
+      script = <<-EOT
+        #!/bin/bash
+        set -euo pipefail
+        READY=$(kubectl get deployment my-app -o jsonpath='{.status.readyReplicas}')
+        WANTED=$(kubectl get deployment my-app -o jsonpath='{.spec.replicas}')
+        jq -n --argjson ready "$${READY:-0}" --argjson wanted "$WANTED" \
+          '{ready_replicas: $ready, desired_replicas: $wanted}' > "$FACETS_RESULT_FILE"
+      EOT
+    }
+  ]
+}
+```
+
+**What the provider renders** when `result = true`:
+
+- the label `facets.cloud/action-key: <action_key>`, which Tekton copies onto every TaskRun so the control plane can identify the action;
+- the annotation `facets.cloud/result-transport: tekton-results`;
+- a Task result `{ name: facets_result, type: string, description: "Facets action result (JSON object)" }`;
+- `FACETS_RESULT_FILE=$(results.facets_result.path)` in the env of every step you declare. The generated `setup-credentials` step is a StepAction `ref`, which Tekton forbids `env` on, so it does not receive it.
+
+**Constraints:**
+
+- The result must be **one JSON object** that matches the action's result schema in the module's `facets.yaml`. Arrays, strings and other scalars are rejected by the control plane.
+- Keep it under roughly **3.5 KB**. Tekton stores Task results in the container termination message, which is capped at 4 KB per pod and shared with Tekton's own bookkeeping; a larger result fails the step.
+- Write the file once, from the step that knows the answer. Steps that write nothing leave the result to whichever step did.
+- `FACETS_RESULT_FILE` is reserved while `result = true`: a step that sets it in `env` fails validation.
+- `result = true` requires `action_key`. `action_key` alone is allowed and only adds the label.
+
+Neither attribute changes anything when unset — no label, annotation, result or env is added, and existing actions show no plan diff.
+
 ## Argument Reference
 
 ### Required Arguments
@@ -308,6 +361,8 @@ resource "facets_tekton_action_kubernetes" "ci_pipeline" {
 * `params` - (List of Objects) List of custom parameters for the Tekton Task. Each parameter has:
   * `name` - (String) Parameter name
   * `type` - (String) Parameter type (e.g., "string", "array")
+* `action_key` - (String) Key of the action as declared in the module's `facets.yaml`. Written to the `facets.cloud/action-key` label on the Task (not the StepAction). Must match `^[a-z][a-z0-9_]{0,62}$` and end with a letter or digit (it is a Kubernetes label value). Changing it updates the Task in place; the Task name does not change.
+* `result` - (Boolean) Whether the action returns a JSON-object result. Defaults to `false`. Requires `action_key`. See [Returning a result](#returning-a-result).
 
 ### Optional Step Arguments
 
@@ -342,6 +397,8 @@ Tekton actions can be imported using the format `namespace/task_name`:
 ```shell
 terraform import facets_tekton_action_kubernetes.example tekton-pipelines/2f5a8b9c1d3e4f6a7b8c9d0e1f2a3b4c
 ```
+
+`action_key` and `result` are read back from the Task's `facets.cloud/action-key` label and `facets_result` result.
 
 Note: The task name is a hash-based identifier. You can find it by running:
 

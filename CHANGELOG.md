@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Reconciliation compares exactly before writing, so a plan against unchanged credentials performs no write, and a key a module stops supplying is removed rather than left injecting a revoked credential.
   - Rotation converges through `Read`: credentials appear in no attribute, so nothing would otherwise prompt Terraform to call `Update`.
   - `name` is not reconstructed on import from the `display_name` label, which is sanitized and cannot round-trip a name containing rejected characters.
+- **Action results** — `action_key` and `result` on `facets_actions` and `facets_tekton_action_kubernetes` let an action return a JSON object to Facets.
+
+  `action_key` names the action as declared in the module's `facets.yaml` and is written to the `facets.cloud/action-key` label, which Tekton copies onto every TaskRun so the control plane can identify the action. `result = true` (which requires `action_key`) declares a `facets_result` Task result, annotates the Task with `facets.cloud/result-transport: tekton-results`, and gives every user step `FACETS_RESULT_FILE=$(results.facets_result.path)`. The script writes one JSON object there, under roughly 3.5 KB; the control plane validates it against the action's result schema.
+
+  ```
+  script  ->  $FACETS_RESULT_FILE  ->  Task result facets_result  ->  CloudEvent  ->  control plane validates
+  ```
+
+  Other details:
+  - Neither attribute renders anything when unset — no label, annotation, result or env — so existing actions plan with no diff. `result` has no schema default for the same reason; null is treated as `false`.
+  - `action_key` must match `^[a-z][a-z0-9_]{0,62}$` and end with a letter or digit, since it is used verbatim as a label value. Changing it updates the Task in place; Task naming is unchanged.
+  - `FACETS_RESULT_FILE` is reserved while `result = true`; a step that sets it fails validation. The kubernetes resource's `setup-credentials` StepAction `ref` step does not receive it, because Tekton rejects `env` on a `ref` step.
+  - A custom `labels` entry for `facets.cloud/action-key` is dropped: only `action_key` can claim an action.
+  - Read and import refresh both attributes from the Task, so an out-of-band change to the label or results shows as drift.
+  - Not added to `facets_tekton_action_aws`.
 
 ### Fixed
 - **An action name containing a space failed the entire apply**, and the same was true of a resource name, kind or environment name. `display_name`, `resource_name`, `resource_kind`, `environment_unique_name` and `cluster_id` were all written to Kubernetes labels unmodified, so any space or other rejected character produced `metadata.labels: Invalid value`. All generated label values are now sanitized, as are user-supplied label keys and values, asserted against Kubernetes' own `IsValidLabelValue` and `IsQualifiedName`. **This affected `facets_tekton_action_aws` and `facets_tekton_action_kubernetes` and predates this release.**
