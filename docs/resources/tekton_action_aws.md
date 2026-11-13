@@ -328,6 +328,8 @@ resource "facets_tekton_action_aws" "data_processing" {
 * `params` - (List of Objects) List of custom parameters for the Tekton Task:
   * `name` - (String) Parameter name
   * `type` - (String) Parameter type (e.g., "string", "array")
+  * `description` - (Optional, String) Help text shown next to the parameter when the action is triggered
+  * `default` - (Optional, String) Value used when the parameter is left empty, which makes it optional. Only allowed on `string` parameters; a parameter without a default is required
 
 ### Optional Step Arguments
 

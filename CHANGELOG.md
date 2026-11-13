@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`description` and `default` on action `params`**, on all three action resources. `description` is shown as help text in the Facets UI, and `default` makes a `string` param optional; without one, Tekton requires the param. Both render only when set, so existing params plan with no diff. `default` on an `array` or `object` param is rejected at plan time.
 - **`facets_actions`** — one action resource for every cloud, replacing the need for a separate resource type per provider.
 
   **Credentials never reach the rendered Task.** Whatever supplies them, the provider writes them to a Kubernetes Secret and attaches it to every step with `envFrom`, so the Task carries only a `secretRef`. Two sources, in precedence order: the `credentials` map on the resource, which a module fills from its own `cloud_account` input, and variables prefixed `FACETS_ACTION_CRED_` in the provider's own environment.

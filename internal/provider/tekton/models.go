@@ -16,8 +16,10 @@ type FacetsResourceModel struct {
 
 // ParamModel represents a Tekton Task parameter
 type ParamModel struct {
-	Name types.String `tfsdk:"name"`
-	Type types.String `tfsdk:"type"`
+	Name        types.String `tfsdk:"name"`
+	Type        types.String `tfsdk:"type"`
+	Description types.String `tfsdk:"description"`
+	Default     types.String `tfsdk:"default"`
 }
 
 // StepModel represents a Tekton Task step

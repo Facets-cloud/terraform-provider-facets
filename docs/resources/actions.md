@@ -145,7 +145,7 @@ Together those mean a StepAction can only carry credentials whose names the prov
 - `cloud_action` — whether the action mutates cloud infrastructure. Sets the `cloud_action` label, which decides whether Facets requires `RUN_CLOUD_ACTION` rather than `RUN_ACTION`. **Set it `true` for anything changing state outside the cluster**; the default of `false` grants the weaker permission.
 - `namespace` — defaults to `tekton-pipelines`. Changing it forces replacement.
 - `labels` — extra labels, merged with the generated ones, which win on conflict. Keys and values are sanitized to what Kubernetes accepts; see [Label sanitization](#label-sanitization).
-- `params` — list of `{ name, type }`; type is `string`, `array` or `object`.
+- `params` — list of `{ name, type, description, default }`. `type` is `string`, `array` or `object`. `description` is optional help text shown in the UI. `default` is optional and only allowed on `string` params; a param with a default is optional when the action is triggered, and one without is required.
 
 ### Optional step arguments
 
