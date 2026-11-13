@@ -224,29 +224,7 @@ func (r *FacetsActionsResource) Schema(ctx context.Context, req resource.SchemaR
 					},
 				},
 			},
-			"params": schema.ListNestedAttribute{
-				Description: "Parameters the action accepts when triggered",
-				Optional:    true,
-				NestedObject: schema.NestedAttributeObject{
-					Attributes: map[string]schema.Attribute{
-						"name": schema.StringAttribute{
-							Description: "Parameter name",
-							Required:    true,
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-								stringvalidator.LengthAtMost(253),
-							},
-						},
-						"type": schema.StringAttribute{
-							Description: "Parameter type",
-							Required:    true,
-							Validators: []validator.String{
-								stringvalidator.OneOf("string", "array", "object"),
-							},
-						},
-					},
-				},
-			},
+			"params": paramsAttribute("Parameters the action accepts when triggered"),
 			"task_name": schema.StringAttribute{
 				Description: "Generated Task name: a hash of resource name, environment and action name",
 				Computed:    true,
@@ -682,12 +660,7 @@ func (r *FacetsActionsResource) buildTask(ctx context.Context, plan *FacetsActio
 		if diags.HasError() {
 			return nil, diags
 		}
-		for _, p := range params {
-			taskParams = append(taskParams, map[string]interface{}{
-				"name": p.Name.ValueString(),
-				"type": p.Type.ValueString(),
-			})
-		}
+		taskParams = append(taskParams, tekton.BuildParamSpecs(params)...)
 	}
 
 	description := plan.Name.ValueString()

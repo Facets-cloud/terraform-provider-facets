@@ -209,29 +209,7 @@ func (r *TektonActionKubernetesResource) Schema(ctx context.Context, req resourc
 					},
 				},
 			},
-			"params": schema.ListNestedAttribute{
-				Description: "List of params for the Tekton Task",
-				Optional:    true,
-				NestedObject: schema.NestedAttributeObject{
-					Attributes: map[string]schema.Attribute{
-						"name": schema.StringAttribute{
-							Description: "Parameter name",
-							Required:    true,
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-								stringvalidator.LengthAtMost(253),
-							},
-						},
-						"type": schema.StringAttribute{
-							Description: "Parameter type (e.g., string, array)",
-							Required:    true,
-							Validators: []validator.String{
-								stringvalidator.OneOf("string", "array", "object"),
-							},
-						},
-					},
-				},
-			},
+			"params": paramsAttribute("List of params for the Tekton Task"),
 			"task_name": schema.StringAttribute{
 				Description: "Generated Tekton Task name (computed from hash of resource_name, environment, and name). " +
 					"This is the actual Kubernetes resource name and may be truncated to 63 characters.",
@@ -790,12 +768,7 @@ func (r *TektonActionKubernetesResource) buildTask(ctx context.Context, plan Tek
 	if !plan.Params.IsNull() {
 		var params []tekton.ParamModel
 		plan.Params.ElementsAs(ctx, &params, false)
-		for _, param := range params {
-			taskParams = append(taskParams, map[string]interface{}{
-				"name": param.Name.ValueString(),
-				"type": param.Type.ValueString(),
-			})
-		}
+		taskParams = append(taskParams, tekton.BuildParamSpecs(params)...)
 	}
 
 	return tekton.BuildTask(tekton.TaskSpec{
