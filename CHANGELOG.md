@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-07
+
 ### Added
 - **`facets_actions`** — one action resource for every cloud, replacing the need for a separate resource type per provider.
 
@@ -43,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 Additive. `facets_tekton_action_aws` and `facets_tekton_action_kubernetes` are unchanged apart from the label fix above, which turns a previously failing configuration into a working one. No schema changes to existing resources.
+
+## [1.2.2] - 2026-05-14
+
+### Fixed
+- **`facets_tekton_action_kubernetes` — namespace changes now force resource recreation** — Added `RequiresReplace()` plan modifier to the `namespace` attribute. Previously, changing the namespace in Terraform configuration produced `Provider produced inconsistent result after apply: .namespace: was cty.StringVal("tekton-pipelines"), but now cty.StringVal("default")` because the `Update` path overwrote the planned namespace with the prior state value. Kubernetes resources cannot be moved between namespaces, so the correct contract is destroy+recreate. Plans now display `# forces replacement` when the namespace changes. The AWS variant is unaffected (it pins namespace to `tekton-pipelines`).
 
 ## [1.2.1] - 2026-05-14
 
@@ -161,8 +168,3 @@ the only field actually used in resource labels. Changes to other fields like `f
 - Support for Kubernetes-based Tekton workflows
 - Support for AWS-based Tekton workflows with AssumeRole
 - Automatic credential injection for both Kubernetes and AWS actions
-
-## [1.2.2] - 2026-05-14
-
-### Fixed
-- **`facets_tekton_action_kubernetes` — namespace changes now force resource recreation** — Added `RequiresReplace()` plan modifier to the `namespace` attribute. Previously, changing the namespace in Terraform configuration produced `Provider produced inconsistent result after apply: .namespace: was cty.StringVal("tekton-pipelines"), but now cty.StringVal("default")` because the `Update` path overwrote the planned namespace with the prior state value. Kubernetes resources cannot be moved between namespaces, so the correct contract is destroy+recreate. Plans now display `# forces replacement` when the namespace changes. The AWS variant is unaffected (it pins namespace to `tekton-pipelines`).
